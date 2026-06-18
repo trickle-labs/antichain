@@ -8,7 +8,7 @@
 // because `(i, W-i) ≤ (j, W-j)` iff `i ≤ j AND j ≤ i` iff `i == j`.
 
 use antichain::{Antichain, Frontier, ProductTimestamp};
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 
 // ── Antichain insert — measures O(n) scan per insert, O(n²) total ─────────────
 

@@ -112,7 +112,9 @@ macro_rules! impl_lattice_ord {
     }
 }
 
-impl_lattice_ord!(u8, u16, u32, u64, u128, usize, i8, i16, i32, i64, i128, isize);
+impl_lattice_ord!(
+    u8, u16, u32, u64, u128, usize, i8, i16, i32, i64, i128, isize
+);
 
 // ── Lattice for 2-tuples ──────────────────────────────────────────────────────
 
@@ -170,9 +172,7 @@ impl<T1: PartialOrd, T2: PartialOrd> PartialOrd for ProductTimestamp<T1, T2> {
         ) {
             (Some(Less), Some(Less | Equal)) | (Some(Equal), Some(Less)) => Some(Less),
             (Some(Equal), Some(Equal)) => Some(Equal),
-            (Some(Greater), Some(Greater | Equal)) | (Some(Equal), Some(Greater)) => {
-                Some(Greater)
-            }
+            (Some(Greater), Some(Greater | Equal)) | (Some(Equal), Some(Greater)) => Some(Greater),
             _ => None, // incomparable
         }
     }
@@ -278,7 +278,9 @@ impl<T: Eq> Eq for Antichain<T> {}
 impl<T: PartialOrd + Clone> Antichain<T> {
     /// Creates an empty antichain.
     pub fn empty() -> Self {
-        Self { elements: Vec::new() }
+        Self {
+            elements: Vec::new(),
+        }
     }
 
     /// Creates an antichain containing a single element.
@@ -294,8 +296,10 @@ impl<T: PartialOrd + Clone> Antichain<T> {
         if self.elements.iter().any(|e| *e <= t) {
             return;
         }
-        self.elements
-            .retain(|e| t.partial_cmp(e).is_none_or(|o| o == core::cmp::Ordering::Greater));
+        self.elements.retain(|e| {
+            t.partial_cmp(e)
+                .is_none_or(|o| o == core::cmp::Ordering::Greater)
+        });
         self.elements.push(t);
     }
 
@@ -337,12 +341,16 @@ impl<T: PartialOrd + Clone> Frontier<T> {
     /// The identity element for [`meet`][Self::meet`] — an unconstrained frontier
     /// with no elements, where no timestamp is reported in-flight.
     pub fn bottom() -> Self {
-        Self { antichain: Antichain::empty() }
+        Self {
+            antichain: Antichain::empty(),
+        }
     }
 
     /// Creates a frontier from a single element.
     pub fn from_elem(t: T) -> Self {
-        Self { antichain: Antichain::from_elem(t) }
+        Self {
+            antichain: Antichain::from_elem(t),
+        }
     }
 
     /// Creates a frontier from an iterator of elements.
@@ -482,9 +490,9 @@ mod tests {
     #[test]
     fn antichain_less_equal() {
         let a = Antichain::from_elem(5u64);
-        assert!(a.less_equal(&3));   // 3 <= 5 → in-flight
-        assert!(a.less_equal(&5));   // 5 <= 5 → in-flight
-        assert!(!a.less_equal(&7));  // 7 > 5  → past the frontier
+        assert!(a.less_equal(&3)); // 3 <= 5 → in-flight
+        assert!(a.less_equal(&5)); // 5 <= 5 → in-flight
+        assert!(!a.less_equal(&7)); // 7 > 5  → past the frontier
     }
 
     // ── Frontier ─────────────────────────────────────────────────────────────
