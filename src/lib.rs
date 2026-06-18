@@ -27,6 +27,20 @@
 //! * [`Bounded<T>`] — clamps values to a `[min, max]` interval, giving a provable upper bound on
 //!   antichain width for finite ranges.
 //!
+//! Phase 7 adds structural and dynamic lattice types:
+//!
+//! * [`WithTop<T>`] — adds a structural `Top` sentinel above all `Value(t)`. `Top` absorbs
+//!   [`Lattice::join`] and is the identity for [`Lattice::meet`]. Signals a permanently-closed
+//!   data path.
+//! * [`WithBottom<T>`] — adds a structural `Bottom` sentinel below all `Value(t)`. `Bottom`
+//!   absorbs [`Lattice::meet`] and is the identity for [`Lattice::join`]. Compose with
+//!   [`WithTop`] to produce `Bottom < Value(t) < Top`.
+//! * [`MapLattice<K, V>`] — point-wise lattice over a `BTreeMap`. Models progress in
+//!   runtime-topology systems where the set of dimensions (shards, partitions) changes
+//!   dynamically. Meet = key-intersection + value-meet; join = key-union + value-join.
+//! * [`SetLattice<T>`] — powerset lattice over a `BTreeSet`. The partial order is set inclusion.
+//!   Meet is intersection; join is union. Models universal acknowledgement across a cluster.
+//!
 //! # Quick start
 //!
 //! ```
@@ -97,6 +111,11 @@ extern crate alloc;
 use alloc::vec;
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
+
+#[cfg(feature = "std")]
+use std::collections::{BTreeMap, BTreeSet};
+#[cfg(not(feature = "std"))]
+use alloc::collections::{BTreeMap, BTreeSet};
 
 // ── Lattice ───────────────────────────────────────────────────────────────────
 
@@ -1798,6 +1817,1104 @@ mod prop_tests_phase6 {
         ) {
             let a = Bounded::new(v, lo, hi);
             prop_assert_eq!(a.meet(&a), a);
+        }
+    }
+}
+
+// ── Phase 7: Advanced structural & dynamic lattices ───────────────────────────
+//
+// Sequencing: 7.3 (WithTop/WithBottom) first — simplest addition and clarifies
+// the bottom/top semantics the others reason about. 7.1 (MapLattice) and 7.2
+// (SetLattice) are independent of each other and follow.
+//
+// Correctness law enforced on every type: the meet/join impls must agree with
+// PartialOrd — i.e. a ≤ b ⟺ meet(a, b) == a ⟺ join(a, b) == b.
+// This consistency law is verified by property tests in prop_tests_phase7.
+
+// ── 7.3 WithTop ───────────────────────────────────────────────────────────────
+
+/// Lifts any type `T` by adding a single `Top` element above all `Value(t)`.
+///
+/// - `Top` is **absorbing for [`Lattice::join`]**: `join(Top, x) = Top`.
+/// - `Top` is the **identity for [`Lattice::meet`]**: `meet(Top, x) = x`.
+/// - Does **not** add a `Bottom` element. Compose with [`WithBottom`] when both
+///   sentinels are needed: `WithTop<WithBottom<T>>` gives a three-level closed lattice
+///   `Bottom < Value(t) < Top`.
+///
+/// **Use case:** when an upstream data source finishes, wrap its final element in
+/// `WithTop::Top` to permanently signal that the data path is closed. Any subsequent
+/// `join` with another frontier element immediately absorbs to `Top`, short-circuiting
+/// progress calculation.
+///
+/// # Example
+///
+/// ```
+/// use antichain::{WithTop, Lattice};
+///
+/// // Top absorbs join.
+/// let top: WithTop<u64> = WithTop::Top;
+/// let val = WithTop::Value(42u64);
+/// assert_eq!(top.join(&val), WithTop::Top);
+/// assert_eq!(val.join(&top), WithTop::Top);
+///
+/// // Top is the identity for meet.
+/// assert_eq!(top.meet(&val), val);
+/// assert_eq!(val.meet(&top), val);
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum WithTop<T> {
+    /// A wrapped value, below `Top`.
+    Value(T),
+    /// The top element, above all `Value(t)`.
+    Top,
+}
+
+impl<T: PartialOrd> PartialOrd for WithTop<T> {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        match (self, other) {
+            (WithTop::Top, WithTop::Top) => Some(core::cmp::Ordering::Equal),
+            (WithTop::Top, WithTop::Value(_)) => Some(core::cmp::Ordering::Greater),
+            (WithTop::Value(_), WithTop::Top) => Some(core::cmp::Ordering::Less),
+            (WithTop::Value(a), WithTop::Value(b)) => a.partial_cmp(b),
+        }
+    }
+}
+
+impl<T: Lattice + Clone> Lattice for WithTop<T> {
+    /// Greatest lower bound: `Top` is the identity — it does not constrain the other value.
+    fn meet(&self, other: &Self) -> Self {
+        match (self, other) {
+            (WithTop::Top, x) => x.clone(),
+            (x, WithTop::Top) => x.clone(),
+            (WithTop::Value(a), WithTop::Value(b)) => WithTop::Value(a.meet(b)),
+        }
+    }
+    /// Least upper bound: `Top` is absorbing — it dominates any other value.
+    fn join(&self, other: &Self) -> Self {
+        match (self, other) {
+            (WithTop::Top, _) | (_, WithTop::Top) => WithTop::Top,
+            (WithTop::Value(a), WithTop::Value(b)) => WithTop::Value(a.join(b)),
+        }
+    }
+}
+
+// ── 7.3 WithBottom ────────────────────────────────────────────────────────────
+
+/// Lifts any type `T` by adding a single `Bottom` element below all `Value(t)`.
+///
+/// - `Bottom` is **absorbing for [`Lattice::meet`]**: `meet(Bottom, x) = Bottom`.
+/// - `Bottom` is the **identity for [`Lattice::join`]**: `join(Bottom, x) = x`.
+/// - Symmetric to [`WithTop`]: compose as `WithTop<WithBottom<T>>` for a closed lattice
+///   `Bottom < Value(t) < Top`.
+///
+/// **Use case:** represents "no progress yet" or "this data path has not started". Makes
+/// the absence of a value explicit in the type system rather than relying on magic constants.
+///
+/// # Example
+///
+/// ```
+/// use antichain::{WithBottom, Lattice};
+///
+/// // Bottom absorbs meet.
+/// let bottom: WithBottom<u64> = WithBottom::Bottom;
+/// let val = WithBottom::Value(42u64);
+/// assert_eq!(bottom.meet(&val), WithBottom::Bottom);
+/// assert_eq!(val.meet(&bottom), WithBottom::Bottom);
+///
+/// // Bottom is the identity for join.
+/// assert_eq!(bottom.join(&val), val);
+/// assert_eq!(val.join(&bottom), val);
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum WithBottom<T> {
+    /// The bottom element, below all `Value(t)`.
+    Bottom,
+    /// A wrapped value, above `Bottom`.
+    Value(T),
+}
+
+impl<T: PartialOrd> PartialOrd for WithBottom<T> {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        match (self, other) {
+            (WithBottom::Bottom, WithBottom::Bottom) => Some(core::cmp::Ordering::Equal),
+            (WithBottom::Bottom, WithBottom::Value(_)) => Some(core::cmp::Ordering::Less),
+            (WithBottom::Value(_), WithBottom::Bottom) => Some(core::cmp::Ordering::Greater),
+            (WithBottom::Value(a), WithBottom::Value(b)) => a.partial_cmp(b),
+        }
+    }
+}
+
+impl<T: Lattice + Clone> Lattice for WithBottom<T> {
+    /// Greatest lower bound: `Bottom` is absorbing — it forces the result to `Bottom`.
+    fn meet(&self, other: &Self) -> Self {
+        match (self, other) {
+            (WithBottom::Bottom, _) | (_, WithBottom::Bottom) => WithBottom::Bottom,
+            (WithBottom::Value(a), WithBottom::Value(b)) => WithBottom::Value(a.meet(b)),
+        }
+    }
+    /// Least upper bound: `Bottom` is the identity — it does not constrain the other value.
+    fn join(&self, other: &Self) -> Self {
+        match (self, other) {
+            (WithBottom::Bottom, x) => x.clone(),
+            (x, WithBottom::Bottom) => x.clone(),
+            (WithBottom::Value(a), WithBottom::Value(b)) => WithBottom::Value(a.join(b)),
+        }
+    }
+}
+
+// ── 7.1 MapLattice ────────────────────────────────────────────────────────────
+
+/// A point-wise lattice over a `BTreeMap<K, V>`.
+///
+/// The natural generalization of [`ProductTimestamp`] to dynamic arities: where
+/// `ProductTimestamp` models a fixed-arity product, `MapLattice` models an open-ended
+/// set of named dimensions that can grow at runtime.
+///
+/// **Partial order:** `M₁ ≤ M₂` iff every key `k` in `M₁` is present in `M₂` with
+/// `M₁[k] ≤ M₂[k]`. Missing keys are implicitly the bottom element (no progress recorded
+/// yet). An empty map is the bottom of the lattice.
+///
+/// **Lattice operations:**
+/// - `join(M₁, M₂)`: key-union; overlapping values take their join. The empty map is the
+///   identity.
+/// - `meet(M₁, M₂)`: key-intersection; overlapping values take their meet. The empty map is
+///   absorbing.
+///
+/// **Use case:** a cluster scales from 10 shards to 100 shards at runtime. Each shard key
+/// appears in the map the moment it first reports progress. Static tuples cannot accommodate
+/// this without recompilation; `MapLattice` makes it expressible with the same coordinator-free
+/// merge guarantee.
+///
+/// # Example
+///
+/// ```
+/// use antichain::{MapLattice, Lattice};
+///
+/// let mut node_a: MapLattice<&str, u64> = MapLattice::new();
+/// node_a.insert("shard-0", 10);
+/// node_a.insert("shard-1", 5);
+///
+/// let mut node_b: MapLattice<&str, u64> = MapLattice::new();
+/// node_b.insert("shard-0", 7);
+/// node_b.insert("shard-2", 3);
+///
+/// // meet: intersection of keys, value-meet (min) on shared keys.
+/// let m = node_a.meet(&node_b);
+/// assert_eq!(m.get(&"shard-0"), Some(&7));
+/// assert_eq!(m.get(&"shard-1"), None); // not in both
+/// assert_eq!(m.get(&"shard-2"), None); // not in both
+///
+/// // join: union of keys, value-join (max) on shared keys.
+/// let j = node_a.join(&node_b);
+/// assert_eq!(j.get(&"shard-0"), Some(&10));
+/// assert_eq!(j.get(&"shard-1"), Some(&5));
+/// assert_eq!(j.get(&"shard-2"), Some(&3));
+/// ```
+#[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct MapLattice<K, V> {
+    map: BTreeMap<K, V>,
+}
+
+impl<K: Ord, V> MapLattice<K, V> {
+    /// Creates an empty `MapLattice` (the bottom element of the lattice).
+    pub fn new() -> Self {
+        Self { map: BTreeMap::new() }
+    }
+
+    /// Inserts or replaces the value for `key`, returning the previous value if any.
+    pub fn insert(&mut self, key: K, value: V) -> Option<V> {
+        self.map.insert(key, value)
+    }
+
+    /// Returns a reference to the value for `key`, or `None` if absent.
+    pub fn get(&self, key: &K) -> Option<&V> {
+        self.map.get(key)
+    }
+
+    /// Returns an iterator over keys in sorted order.
+    pub fn keys(&self) -> impl Iterator<Item = &K> {
+        self.map.keys()
+    }
+
+    /// Returns an iterator over values in key-sorted order.
+    pub fn values(&self) -> impl Iterator<Item = &V> {
+        self.map.values()
+    }
+
+    /// Returns the number of key-value pairs.
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    /// Returns `true` if the map has no entries (i.e., this is the bottom element).
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+}
+
+impl<K: Ord, V> Default for MapLattice<K, V> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<K: Ord, V: PartialEq> PartialEq for MapLattice<K, V> {
+    fn eq(&self, other: &Self) -> bool {
+        self.map == other.map
+    }
+}
+
+impl<K: Ord, V: Eq> Eq for MapLattice<K, V> {}
+
+impl<K: Ord, V: PartialOrd> PartialOrd for MapLattice<K, V> {
+    /// `M₁ ≤ M₂` iff every key `k` in `M₁` is present in `M₂` with `M₁[k] ≤ M₂[k]`.
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        let self_le = self.map.iter().all(|(k, v)| {
+            other.map.get(k).map_or(false, |ov| v <= ov)
+        });
+        let other_le = other.map.iter().all(|(k, v)| {
+            self.map.get(k).map_or(false, |sv| v <= sv)
+        });
+        match (self_le, other_le) {
+            (true, true) => Some(core::cmp::Ordering::Equal),
+            (true, false) => Some(core::cmp::Ordering::Less),
+            (false, true) => Some(core::cmp::Ordering::Greater),
+            (false, false) => None,
+        }
+    }
+}
+
+impl<K: Ord + Clone, V: Lattice + Clone> Lattice for MapLattice<K, V> {
+    /// Key-union with value-join on overlapping keys. The empty map is the identity.
+    fn join(&self, other: &Self) -> Self {
+        let mut result = self.map.clone();
+        for (k, v) in &other.map {
+            result
+                .entry(k.clone())
+                .and_modify(|existing| *existing = existing.join(v))
+                .or_insert_with(|| v.clone());
+        }
+        Self { map: result }
+    }
+
+    /// Key-intersection with value-meet on overlapping keys. The empty map is absorbing.
+    fn meet(&self, other: &Self) -> Self {
+        let mut result = BTreeMap::new();
+        for (k, v) in &self.map {
+            if let Some(ov) = other.map.get(k) {
+                result.insert(k.clone(), v.meet(ov));
+            }
+        }
+        Self { map: result }
+    }
+}
+
+// ── 7.2 SetLattice ────────────────────────────────────────────────────────────
+
+/// A powerset lattice over a `BTreeSet<T>`.
+///
+/// The partial order is set inclusion: `A ≤ B` iff `A ⊆ B`. Meet is intersection;
+/// join is union. The empty set is the bottom element (identity for join, absorbing for meet).
+///
+/// **Use case:** a global configuration state is advanced only when the set of acknowledging
+/// nodes matches the expected cluster membership. Each node publishes its current
+/// acknowledgement set; the coordinator-free merge (`meet` = intersection) computes the
+/// universal acknowledgement — the set of nodes that *every* observer has confirmed.
+///
+/// **Note:** four lines of logic around `BTreeSet` — the value is the semantic contract
+/// and the property tests, not the complexity of the implementation.
+///
+/// # Example
+///
+/// ```
+/// use antichain::{SetLattice, Lattice};
+///
+/// let mut s1 = SetLattice::new();
+/// s1.insert(1u64);
+/// s1.insert(2u64);
+///
+/// let mut s2 = SetLattice::new();
+/// s2.insert(2u64);
+/// s2.insert(3u64);
+///
+/// // meet = intersection {2}
+/// let m = s1.meet(&s2);
+/// assert!(m.contains(&2));
+/// assert!(!m.contains(&1));
+/// assert!(!m.contains(&3));
+///
+/// // join = union {1, 2, 3}
+/// let j = s1.join(&s2);
+/// assert!(j.contains(&1) && j.contains(&2) && j.contains(&3));
+/// ```
+#[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct SetLattice<T> {
+    set: BTreeSet<T>,
+}
+
+impl<T: Ord> SetLattice<T> {
+    /// Creates an empty `SetLattice` (the bottom element of the lattice).
+    pub fn new() -> Self {
+        Self { set: BTreeSet::new() }
+    }
+
+    /// Inserts `value` into the set. Returns `true` if the value was not already present.
+    pub fn insert(&mut self, value: T) -> bool {
+        self.set.insert(value)
+    }
+
+    /// Returns `true` if `value` is a member of the set.
+    pub fn contains(&self, value: &T) -> bool {
+        self.set.contains(value)
+    }
+
+    /// Returns the number of elements in the set.
+    pub fn len(&self) -> usize {
+        self.set.len()
+    }
+
+    /// Returns `true` if the set is empty (i.e., this is the bottom element).
+    pub fn is_empty(&self) -> bool {
+        self.set.is_empty()
+    }
+
+    /// Returns an iterator over the elements in sorted order.
+    pub fn iter(&self) -> impl Iterator<Item = &T> {
+        self.set.iter()
+    }
+}
+
+impl<T: Ord> Default for SetLattice<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T: Ord> PartialEq for SetLattice<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.set == other.set
+    }
+}
+
+impl<T: Ord> Eq for SetLattice<T> {}
+
+impl<T: Ord> PartialOrd for SetLattice<T> {
+    /// `A ≤ B` iff `A ⊆ B`.
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        let self_le = self.set.is_subset(&other.set);
+        let other_le = other.set.is_subset(&self.set);
+        match (self_le, other_le) {
+            (true, true) => Some(core::cmp::Ordering::Equal),
+            (true, false) => Some(core::cmp::Ordering::Less),
+            (false, true) => Some(core::cmp::Ordering::Greater),
+            (false, false) => None,
+        }
+    }
+}
+
+impl<T: Ord + Clone> Lattice for SetLattice<T> {
+    /// Intersection — the greatest lower bound under set inclusion.
+    fn meet(&self, other: &Self) -> Self {
+        Self { set: self.set.intersection(&other.set).cloned().collect() }
+    }
+    /// Union — the least upper bound under set inclusion.
+    fn join(&self, other: &Self) -> Self {
+        Self { set: self.set.union(&other.set).cloned().collect() }
+    }
+}
+
+// ── Phase 7 unit tests ────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests_phase7 {
+    use super::*;
+
+    // ── WithTop ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn with_top_order_top_greatest() {
+        let top: WithTop<u64> = WithTop::Top;
+        let val = WithTop::Value(u64::MAX);
+        assert!(top > val);
+        assert!(val < top);
+    }
+
+    #[test]
+    fn with_top_order_values_follow_inner() {
+        assert!(WithTop::Value(3u64) < WithTop::Value(7u64));
+        assert!(WithTop::Value(7u64) > WithTop::Value(3u64));
+        assert_eq!(WithTop::Value(5u64), WithTop::Value(5u64));
+    }
+
+    #[test]
+    fn with_top_meet_top_is_identity() {
+        let top: WithTop<u64> = WithTop::Top;
+        let val = WithTop::Value(42u64);
+        assert_eq!(top.meet(&val), val.clone());
+        assert_eq!(val.meet(&top), val);
+    }
+
+    #[test]
+    fn with_top_meet_values_delegates_to_inner() {
+        assert_eq!(
+            WithTop::Value(3u64).meet(&WithTop::Value(7u64)),
+            WithTop::Value(3u64)
+        );
+    }
+
+    #[test]
+    fn with_top_join_top_is_absorbing() {
+        let top: WithTop<u64> = WithTop::Top;
+        let val = WithTop::Value(42u64);
+        assert_eq!(top.join(&val), WithTop::Top);
+        assert_eq!(val.join(&top), WithTop::Top);
+    }
+
+    #[test]
+    fn with_top_join_values_delegates_to_inner() {
+        assert_eq!(
+            WithTop::Value(3u64).join(&WithTop::Value(7u64)),
+            WithTop::Value(7u64)
+        );
+    }
+
+    #[test]
+    fn with_top_meet_top_top_is_top() {
+        let top: WithTop<u64> = WithTop::Top;
+        assert_eq!(top.meet(&top), WithTop::Top);
+    }
+
+    #[test]
+    fn with_top_join_top_top_is_top() {
+        let top: WithTop<u64> = WithTop::Top;
+        assert_eq!(top.join(&top), WithTop::Top);
+    }
+
+    // ── WithBottom ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn with_bottom_order_bottom_least() {
+        let bottom: WithBottom<u64> = WithBottom::Bottom;
+        let val = WithBottom::Value(0u64);
+        assert!(bottom < val);
+        assert!(val > bottom);
+    }
+
+    #[test]
+    fn with_bottom_order_values_follow_inner() {
+        assert!(WithBottom::Value(3u64) < WithBottom::Value(7u64));
+    }
+
+    #[test]
+    fn with_bottom_meet_bottom_is_absorbing() {
+        let bottom: WithBottom<u64> = WithBottom::Bottom;
+        let val = WithBottom::Value(42u64);
+        assert_eq!(bottom.meet(&val), WithBottom::Bottom);
+        assert_eq!(val.meet(&bottom), WithBottom::Bottom);
+    }
+
+    #[test]
+    fn with_bottom_meet_values_delegates_to_inner() {
+        assert_eq!(
+            WithBottom::Value(3u64).meet(&WithBottom::Value(7u64)),
+            WithBottom::Value(3u64)
+        );
+    }
+
+    #[test]
+    fn with_bottom_join_bottom_is_identity() {
+        let bottom: WithBottom<u64> = WithBottom::Bottom;
+        let val = WithBottom::Value(42u64);
+        assert_eq!(bottom.join(&val), val.clone());
+        assert_eq!(val.join(&bottom), val);
+    }
+
+    #[test]
+    fn with_bottom_join_values_delegates_to_inner() {
+        assert_eq!(
+            WithBottom::Value(3u64).join(&WithBottom::Value(7u64)),
+            WithBottom::Value(7u64)
+        );
+    }
+
+    // ── WithTop<WithBottom<T>> composition ───────────────────────────────────
+
+    #[test]
+    fn with_top_with_bottom_three_level_order() {
+        let bottom: WithTop<WithBottom<u64>> = WithTop::Value(WithBottom::Bottom);
+        let val: WithTop<WithBottom<u64>> = WithTop::Value(WithBottom::Value(5u64));
+        let top: WithTop<WithBottom<u64>> = WithTop::Top;
+
+        assert!(bottom < val);
+        assert!(val < top);
+        assert!(bottom < top);
+    }
+
+    #[test]
+    fn with_top_with_bottom_meet_top_is_identity() {
+        let val: WithTop<WithBottom<u64>> = WithTop::Value(WithBottom::Value(5u64));
+        let top: WithTop<WithBottom<u64>> = WithTop::Top;
+        assert_eq!(top.meet(&val), val.clone());
+    }
+
+    #[test]
+    fn with_top_with_bottom_join_bottom_is_identity() {
+        let bottom: WithTop<WithBottom<u64>> = WithTop::Value(WithBottom::Bottom);
+        let val: WithTop<WithBottom<u64>> = WithTop::Value(WithBottom::Value(5u64));
+        assert_eq!(bottom.join(&val), val.clone());
+    }
+
+    // ── MapLattice ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn map_lattice_new_is_empty() {
+        let m: MapLattice<u64, u64> = MapLattice::new();
+        assert!(m.is_empty());
+        assert_eq!(m.len(), 0);
+    }
+
+    #[test]
+    fn map_lattice_insert_and_get() {
+        let mut m: MapLattice<&str, u64> = MapLattice::new();
+        m.insert("a", 10);
+        assert_eq!(m.get(&"a"), Some(&10));
+        assert_eq!(m.get(&"b"), None);
+    }
+
+    #[test]
+    fn map_lattice_meet_is_key_intersection_with_value_meet() {
+        let mut a: MapLattice<&str, u64> = MapLattice::new();
+        a.insert("x", 10);
+        a.insert("y", 5);
+        let mut b: MapLattice<&str, u64> = MapLattice::new();
+        b.insert("x", 7);
+        b.insert("z", 3);
+
+        let m = a.meet(&b);
+        assert_eq!(m.get(&"x"), Some(&7)); // min(10, 7)
+        assert_eq!(m.get(&"y"), None);     // not in b
+        assert_eq!(m.get(&"z"), None);     // not in a
+    }
+
+    #[test]
+    fn map_lattice_join_is_key_union_with_value_join() {
+        let mut a: MapLattice<&str, u64> = MapLattice::new();
+        a.insert("x", 10);
+        a.insert("y", 5);
+        let mut b: MapLattice<&str, u64> = MapLattice::new();
+        b.insert("x", 7);
+        b.insert("z", 3);
+
+        let j = a.join(&b);
+        assert_eq!(j.get(&"x"), Some(&10)); // max(10, 7)
+        assert_eq!(j.get(&"y"), Some(&5));  // only in a
+        assert_eq!(j.get(&"z"), Some(&3));  // only in b
+    }
+
+    #[test]
+    fn map_lattice_meet_empty_is_absorbing() {
+        let mut a: MapLattice<&str, u64> = MapLattice::new();
+        a.insert("x", 10);
+        let empty: MapLattice<&str, u64> = MapLattice::new();
+
+        assert!(a.meet(&empty).is_empty());
+        assert!(empty.meet(&a).is_empty());
+    }
+
+    #[test]
+    fn map_lattice_join_empty_is_identity() {
+        let mut a: MapLattice<&str, u64> = MapLattice::new();
+        a.insert("x", 10);
+        let empty: MapLattice<&str, u64> = MapLattice::new();
+
+        assert_eq!(a.join(&empty), a.clone());
+        assert_eq!(empty.join(&a), a.clone());
+    }
+
+    #[test]
+    fn map_lattice_partial_order_empty_le_all() {
+        let empty: MapLattice<u64, u64> = MapLattice::new();
+        let mut nonempty: MapLattice<u64, u64> = MapLattice::new();
+        nonempty.insert(1, 5);
+        assert!(empty <= nonempty);
+        assert!(!(nonempty <= empty));
+    }
+
+    #[test]
+    fn map_lattice_partial_order_subset_with_lower_values() {
+        let mut a: MapLattice<u64, u64> = MapLattice::new();
+        a.insert(1, 3);
+        let mut b: MapLattice<u64, u64> = MapLattice::new();
+        b.insert(1, 7);
+        b.insert(2, 5);
+        // a <= b: a's key {1} ⊆ b's keys {1,2}, and a[1]=3 <= b[1]=7
+        assert!(a <= b);
+        assert!(!(b <= a));
+    }
+
+    #[test]
+    fn map_lattice_partial_order_incomparable() {
+        let mut a: MapLattice<u64, u64> = MapLattice::new();
+        a.insert(1, 10);
+        a.insert(2, 3);
+        let mut b: MapLattice<u64, u64> = MapLattice::new();
+        b.insert(1, 3);
+        b.insert(2, 10);
+        assert_eq!(a.partial_cmp(&b), None);
+    }
+
+    #[test]
+    fn map_lattice_keys_and_values_iterators() {
+        let mut m: MapLattice<u64, u64> = MapLattice::new();
+        m.insert(1, 10);
+        m.insert(2, 20);
+        let keys: Vec<_> = m.keys().copied().collect();
+        let values: Vec<_> = m.values().copied().collect();
+        assert_eq!(keys, vec![1, 2]);
+        assert_eq!(values, vec![10, 20]);
+    }
+
+    // ── SetLattice ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn set_lattice_new_is_empty() {
+        let s: SetLattice<u64> = SetLattice::new();
+        assert!(s.is_empty());
+        assert_eq!(s.len(), 0);
+    }
+
+    #[test]
+    fn set_lattice_insert_and_contains() {
+        let mut s: SetLattice<u64> = SetLattice::new();
+        s.insert(1);
+        s.insert(2);
+        assert!(s.contains(&1));
+        assert!(s.contains(&2));
+        assert!(!s.contains(&3));
+    }
+
+    #[test]
+    fn set_lattice_meet_is_intersection() {
+        let mut a: SetLattice<u64> = SetLattice::new();
+        a.insert(1);
+        a.insert(2);
+        let mut b: SetLattice<u64> = SetLattice::new();
+        b.insert(2);
+        b.insert(3);
+        let m = a.meet(&b);
+        assert!(m.contains(&2));
+        assert!(!m.contains(&1));
+        assert!(!m.contains(&3));
+    }
+
+    #[test]
+    fn set_lattice_join_is_union() {
+        let mut a: SetLattice<u64> = SetLattice::new();
+        a.insert(1);
+        a.insert(2);
+        let mut b: SetLattice<u64> = SetLattice::new();
+        b.insert(2);
+        b.insert(3);
+        let j = a.join(&b);
+        assert!(j.contains(&1) && j.contains(&2) && j.contains(&3));
+    }
+
+    #[test]
+    fn set_lattice_meet_is_commutative() {
+        let mut a: SetLattice<u64> = SetLattice::new();
+        a.insert(1);
+        a.insert(2);
+        let mut b: SetLattice<u64> = SetLattice::new();
+        b.insert(2);
+        b.insert(3);
+        assert_eq!(a.meet(&b), b.meet(&a));
+    }
+
+    #[test]
+    fn set_lattice_join_is_commutative() {
+        let mut a: SetLattice<u64> = SetLattice::new();
+        a.insert(1);
+        let mut b: SetLattice<u64> = SetLattice::new();
+        b.insert(2);
+        assert_eq!(a.join(&b), b.join(&a));
+    }
+
+    #[test]
+    fn set_lattice_partial_order_empty_le_all() {
+        let empty: SetLattice<u64> = SetLattice::new();
+        let mut nonempty: SetLattice<u64> = SetLattice::new();
+        nonempty.insert(1);
+        assert!(empty <= nonempty);
+        assert!(!(nonempty <= empty));
+    }
+
+    #[test]
+    fn set_lattice_partial_order_subset() {
+        let mut sub: SetLattice<u64> = SetLattice::new();
+        sub.insert(1);
+        let mut sup: SetLattice<u64> = SetLattice::new();
+        sup.insert(1);
+        sup.insert(2);
+        assert!(sub <= sup);
+        assert!(!(sup <= sub));
+    }
+
+    #[test]
+    fn set_lattice_partial_order_incomparable() {
+        let mut a: SetLattice<u64> = SetLattice::new();
+        a.insert(1);
+        let mut b: SetLattice<u64> = SetLattice::new();
+        b.insert(2);
+        assert_eq!(a.partial_cmp(&b), None);
+    }
+
+    #[test]
+    fn set_lattice_meet_empty_is_absorbing() {
+        let mut a: SetLattice<u64> = SetLattice::new();
+        a.insert(1);
+        let empty: SetLattice<u64> = SetLattice::new();
+        assert!(a.meet(&empty).is_empty());
+        assert!(empty.meet(&a).is_empty());
+    }
+
+    #[test]
+    fn set_lattice_join_empty_is_identity() {
+        let mut a: SetLattice<u64> = SetLattice::new();
+        a.insert(1);
+        let empty: SetLattice<u64> = SetLattice::new();
+        assert_eq!(a.join(&empty), a.clone());
+        assert_eq!(empty.join(&a), a.clone());
+    }
+
+    // ── Frontier<WithTop<u64>> ────────────────────────────────────────────────
+
+    #[test]
+    fn frontier_with_top_top_dominates_any_value() {
+        let ft = Frontier::from_elem(WithTop::<u64>::Top);
+        let fv = Frontier::from_elem(WithTop::Value(u64::MAX));
+        // After meet, only Top survives (Top is the bottom of the inverted order means
+        // Top "dominates" Value in terms of less_equal for Frontier::meet).
+        // Actually: in WithTop, Value < Top, so the frontier meet keeps the lower element = Value.
+        // Frontier::meet = antichain meet = builds union of elements then deduplicates.
+        // Top > Value(MAX), so Top dominates Value — only Value survives in the antichain.
+        let m = ft.meet(&fv);
+        assert_eq!(m.elements().len(), 1);
+        assert_eq!(m.elements()[0], WithTop::Value(u64::MAX));
+    }
+
+    #[test]
+    fn frontier_with_bottom_bottom_is_dominated() {
+        let fb = Frontier::from_elem(WithBottom::<u64>::Bottom);
+        let fv = Frontier::from_elem(WithBottom::Value(0u64));
+        // Bottom < Value(0), so Bottom is dominated by Value — only Bottom survives in meet.
+        let m = fb.meet(&fv);
+        assert_eq!(m.elements().len(), 1);
+        assert_eq!(m.elements()[0], WithBottom::Bottom);
+    }
+}
+
+// ── Phase 7 property tests ────────────────────────────────────────────────────
+//
+// Key law enforced by every prop test: a ≤ b ⟺ meet(a, b) == a ⟺ join(a, b) == b.
+// This PartialOrd/meet/join consistency law is the hardest to violate correctly and
+// the most important to verify for dynamic-arity and lifted lattices.
+
+#[cfg(test)]
+mod prop_tests_phase7 {
+    use super::*;
+    use proptest::prelude::*;
+
+    // ── Strategies ────────────────────────────────────────────────────────────
+
+    prop_compose! {
+        fn arb_with_top_u64()(
+            is_top in any::<bool>(), v in any::<u64>()
+        ) -> WithTop<u64> {
+            if is_top { WithTop::Top } else { WithTop::Value(v) }
+        }
+    }
+
+    prop_compose! {
+        fn arb_with_bottom_u64()(
+            is_bottom in any::<bool>(), v in any::<u64>()
+        ) -> WithBottom<u64> {
+            if is_bottom { WithBottom::Bottom } else { WithBottom::Value(v) }
+        }
+    }
+
+    prop_compose! {
+        fn arb_map_lattice()(
+            entries in prop::collection::vec((any::<u64>(), any::<u64>()), 0..8)
+        ) -> MapLattice<u64, u64> {
+            let mut m = MapLattice::new();
+            for (k, v) in entries { m.insert(k, v); }
+            m
+        }
+    }
+
+    prop_compose! {
+        fn arb_set_lattice()(
+            elems in prop::collection::vec(0u64..20u64, 0..8)
+        ) -> SetLattice<u64> {
+            let mut s = SetLattice::new();
+            for e in elems { s.insert(e); }
+            s
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(10_000))]
+
+        // ── WithTop<u64>: order and Lattice laws ──────────────────────────────
+
+        #[test]
+        fn prop_with_top_meet_commutative(
+            a in arb_with_top_u64(), b in arb_with_top_u64()
+        ) {
+            prop_assert_eq!(a.meet(&b), b.meet(&a));
+        }
+
+        #[test]
+        fn prop_with_top_meet_associative(
+            a in arb_with_top_u64(), b in arb_with_top_u64(), c in arb_with_top_u64()
+        ) {
+            prop_assert_eq!(a.meet(&b.meet(&c)), a.meet(&b).meet(&c));
+        }
+
+        #[test]
+        fn prop_with_top_meet_idempotent(a in arb_with_top_u64()) {
+            prop_assert_eq!(a.meet(&a), a);
+        }
+
+        #[test]
+        fn prop_with_top_join_commutative(
+            a in arb_with_top_u64(), b in arb_with_top_u64()
+        ) {
+            prop_assert_eq!(a.join(&b), b.join(&a));
+        }
+
+        #[test]
+        fn prop_with_top_join_associative(
+            a in arb_with_top_u64(), b in arb_with_top_u64(), c in arb_with_top_u64()
+        ) {
+            prop_assert_eq!(a.join(&b.join(&c)), a.join(&b).join(&c));
+        }
+
+        #[test]
+        fn prop_with_top_join_idempotent(a in arb_with_top_u64()) {
+            prop_assert_eq!(a.join(&a), a);
+        }
+
+        /// PartialOrd/meet consistency: a ≤ b ⟹ meet(a, b) == a.
+        #[test]
+        fn prop_with_top_meet_consistency(
+            a in arb_with_top_u64(), b in arb_with_top_u64()
+        ) {
+            if let Some(ord) = a.partial_cmp(&b) {
+                if ord.is_le() {
+                    prop_assert_eq!(a.meet(&b), a.clone());
+                    prop_assert_eq!(a.join(&b), b.clone());
+                }
+            }
+        }
+
+        /// meet is always a lower bound: meet(a, b) ≤ a and meet(a, b) ≤ b.
+        #[test]
+        fn prop_with_top_meet_is_lower_bound(
+            a in arb_with_top_u64(), b in arb_with_top_u64()
+        ) {
+            let m = a.meet(&b);
+            prop_assert!(m <= a);
+            prop_assert!(m <= b);
+        }
+
+        // ── WithBottom<u64>: Lattice laws ─────────────────────────────────────
+
+        #[test]
+        fn prop_with_bottom_meet_commutative(
+            a in arb_with_bottom_u64(), b in arb_with_bottom_u64()
+        ) {
+            prop_assert_eq!(a.meet(&b), b.meet(&a));
+        }
+
+        #[test]
+        fn prop_with_bottom_meet_associative(
+            a in arb_with_bottom_u64(), b in arb_with_bottom_u64(), c in arb_with_bottom_u64()
+        ) {
+            prop_assert_eq!(a.meet(&b.meet(&c)), a.meet(&b).meet(&c));
+        }
+
+        #[test]
+        fn prop_with_bottom_meet_idempotent(a in arb_with_bottom_u64()) {
+            prop_assert_eq!(a.meet(&a), a);
+        }
+
+        #[test]
+        fn prop_with_bottom_join_commutative(
+            a in arb_with_bottom_u64(), b in arb_with_bottom_u64()
+        ) {
+            prop_assert_eq!(a.join(&b), b.join(&a));
+        }
+
+        #[test]
+        fn prop_with_bottom_join_idempotent(a in arb_with_bottom_u64()) {
+            prop_assert_eq!(a.join(&a), a);
+        }
+
+        /// PartialOrd/meet consistency for WithBottom.
+        #[test]
+        fn prop_with_bottom_meet_consistency(
+            a in arb_with_bottom_u64(), b in arb_with_bottom_u64()
+        ) {
+            if let Some(ord) = a.partial_cmp(&b) {
+                if ord.is_le() {
+                    prop_assert_eq!(a.meet(&b), a.clone());
+                    prop_assert_eq!(a.join(&b), b.clone());
+                }
+            }
+        }
+
+        // ── MapLattice<u64, u64>: Lattice laws ───────────────────────────────
+
+        #[test]
+        fn prop_map_lattice_meet_commutative(
+            a in arb_map_lattice(), b in arb_map_lattice()
+        ) {
+            prop_assert_eq!(a.meet(&b), b.meet(&a));
+        }
+
+        #[test]
+        fn prop_map_lattice_meet_associative(
+            a in arb_map_lattice(), b in arb_map_lattice(), c in arb_map_lattice()
+        ) {
+            prop_assert_eq!(a.meet(&b.meet(&c)), a.meet(&b).meet(&c));
+        }
+
+        #[test]
+        fn prop_map_lattice_meet_idempotent(a in arb_map_lattice()) {
+            prop_assert_eq!(a.meet(&a), a);
+        }
+
+        #[test]
+        fn prop_map_lattice_join_commutative(
+            a in arb_map_lattice(), b in arb_map_lattice()
+        ) {
+            prop_assert_eq!(a.join(&b), b.join(&a));
+        }
+
+        #[test]
+        fn prop_map_lattice_join_associative(
+            a in arb_map_lattice(), b in arb_map_lattice(), c in arb_map_lattice()
+        ) {
+            prop_assert_eq!(a.join(&b.join(&c)), a.join(&b).join(&c));
+        }
+
+        #[test]
+        fn prop_map_lattice_join_idempotent(a in arb_map_lattice()) {
+            prop_assert_eq!(a.join(&a), a);
+        }
+
+        /// PartialOrd/meet consistency (the critical law for dynamic lattices).
+        ///
+        /// a ≤ b ⟹ meet(a, b) == a AND join(a, b) == b.
+        #[test]
+        fn prop_map_lattice_meet_consistency(
+            a in arb_map_lattice(), b in arb_map_lattice()
+        ) {
+            if let Some(ord) = a.partial_cmp(&b) {
+                if ord.is_le() {
+                    prop_assert_eq!(a.meet(&b), a.clone());
+                    prop_assert_eq!(a.join(&b), b.clone());
+                }
+            }
+        }
+
+        /// meet is always a lower bound.
+        #[test]
+        fn prop_map_lattice_meet_is_lower_bound(
+            a in arb_map_lattice(), b in arb_map_lattice()
+        ) {
+            let m = a.meet(&b);
+            // m <= a and m <= b (partial_cmp returns Some(Less) or Some(Equal))
+            prop_assert!(m.partial_cmp(&a).map_or(false, |o| o.is_le()));
+            prop_assert!(m.partial_cmp(&b).map_or(false, |o| o.is_le()));
+        }
+
+        /// join is always an upper bound.
+        #[test]
+        fn prop_map_lattice_join_is_upper_bound(
+            a in arb_map_lattice(), b in arb_map_lattice()
+        ) {
+            let j = a.join(&b);
+            prop_assert!(a.partial_cmp(&j).map_or(false, |o| o.is_le()));
+            prop_assert!(b.partial_cmp(&j).map_or(false, |o| o.is_le()));
+        }
+
+        // ── SetLattice<u64>: Lattice laws ─────────────────────────────────────
+
+        #[test]
+        fn prop_set_lattice_meet_commutative(
+            a in arb_set_lattice(), b in arb_set_lattice()
+        ) {
+            prop_assert_eq!(a.meet(&b), b.meet(&a));
+        }
+
+        #[test]
+        fn prop_set_lattice_meet_associative(
+            a in arb_set_lattice(), b in arb_set_lattice(), c in arb_set_lattice()
+        ) {
+            prop_assert_eq!(a.meet(&b.meet(&c)), a.meet(&b).meet(&c));
+        }
+
+        #[test]
+        fn prop_set_lattice_meet_idempotent(a in arb_set_lattice()) {
+            prop_assert_eq!(a.meet(&a), a);
+        }
+
+        #[test]
+        fn prop_set_lattice_join_commutative(
+            a in arb_set_lattice(), b in arb_set_lattice()
+        ) {
+            prop_assert_eq!(a.join(&b), b.join(&a));
+        }
+
+        #[test]
+        fn prop_set_lattice_join_associative(
+            a in arb_set_lattice(), b in arb_set_lattice(), c in arb_set_lattice()
+        ) {
+            prop_assert_eq!(a.join(&b.join(&c)), a.join(&b).join(&c));
+        }
+
+        #[test]
+        fn prop_set_lattice_join_idempotent(a in arb_set_lattice()) {
+            prop_assert_eq!(a.join(&a), a);
+        }
+
+        /// PartialOrd/meet consistency for SetLattice.
+        #[test]
+        fn prop_set_lattice_meet_consistency(
+            a in arb_set_lattice(), b in arb_set_lattice()
+        ) {
+            if let Some(ord) = a.partial_cmp(&b) {
+                if ord.is_le() {
+                    prop_assert_eq!(a.meet(&b), a.clone());
+                    prop_assert_eq!(a.join(&b), b.clone());
+                }
+            }
+        }
+
+        /// meet is always a lower bound under set inclusion.
+        #[test]
+        fn prop_set_lattice_meet_is_lower_bound(
+            a in arb_set_lattice(), b in arb_set_lattice()
+        ) {
+            let m = a.meet(&b);
+            prop_assert!(m.partial_cmp(&a).map_or(false, |o| o.is_le()));
+            prop_assert!(m.partial_cmp(&b).map_or(false, |o| o.is_le()));
         }
     }
 }

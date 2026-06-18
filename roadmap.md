@@ -18,6 +18,8 @@
 | 4 | Hardening | Benchmarks, fuzzing, docs, `#![no_std]` compat | Crate is publishable |
 | 5 | Formal specification | TLA⁺ or Lean proof of convergence | Spec written, convergence proven |
 | 6 | Extended composition patterns | Additional useful partial orders | ✅ `Max<T>`, `Min<T>`, `Bounded<T>` working |
+| 7 | Advanced structural & dynamic lattices | Dynamic, lifted, and set-based orders | ✅ `MapLattice`, `SetLattice`, `WithTop`/`WithBottom` in core; `IntervalSetLattice` deferred to companion crate; `SumOrder` deferred |
+| 8 | Performance & real-world validation | Compaction, benchmarked width bounds, downstream adapter | `meet` width bound documented or compacted; an adapter crate exercises the core; Phase 6 design debt resolved |
 
 ---
 
@@ -303,6 +305,248 @@ Document patterns like:
 - Integration with the formal spec: prove that nesting preserves the convergence guarantee
 
 All patterns are covered by unit tests in `tests_phase6` and property tests in `prop_tests_phase6`.
+
+### 6.4 Retrospective — known design debt
+
+Phase 6 shipped and is fully tested, but two items carry design debt to revisit (tracked in
+Phase 8):
+
+- **`Min<T>` is a transparent newtype.** It delegates every `Lattice` and `PartialOrd` operation
+  straight to `T`, so its only value is documentary intent (pairing with `Max<T>` in composites
+  like `(Max<u64>, Min<u64>)`). It adds permanent public API surface for readability alone.
+  Acceptable for now; reconsider whether it earns its place once downstream usage exists.
+- **`Bounded<T>` carries instance-level bounds and breaks the `PartialOrd`-only contract.**
+  - Each value stores `value/min/max` (3× memory); `meet`/`join` arbitrarily use `self`'s bounds,
+    so mixing values with different ranges in one antichain is *documented as undefined* — a
+    footgun in the crate's core operation.
+  - It requires `T: Ord`, while the rest of the crate is built on `PartialOrd`. As a result
+    `Bounded<ProductTimestamp<…>>` does **not** compose, which undercuts the composition thesis.
+  - **Phase 8 candidate:** redesign with type-level bounds (const generics where feasible) or drop
+    per-instance bounds, driven by what a real downstream adapter actually needs.
+
+---
+
+## Phase 7 — Advanced structural & dynamic lattices
+
+**Goal:** extend the composition toolkit from fixed-arity scalar wrappers to dynamic, lifted, and
+set-based lattice structures that model the topological shapes real distributed systems produce.
+
+**Sequencing rationale:** implement **7.3 (`WithTop`/`WithBottom`) first** — it is the simplest
+addition and clarifies the bottom/top semantics the others reason about. 7.1 and 7.2 are
+independent of each other and follow. `SumOrder` (deferred, post-Phase 7) algebraically depends on
+`WithTop`/`WithBottom` to close its meet operation. 7.4 (`IntervalSetLattice`) is a candidate for a
+companion crate (`antichain-intervals`) rather than the core crate to keep the dependency surface
+small.
+
+**Correctness law to enforce on every type below:** the `meet`/`join` impls must agree with
+`PartialOrd` — i.e. `a ≤ b ⟺ meet(a, b) == a ⟺ join(a, b) == b`. This consistency law is where
+dynamic-arity and lifted lattices most often hide subtle bugs; make it an explicit property test,
+not just commutativity/associativity/idempotence.
+
+### 7.1 `MapLattice<K, V>` — point-wise dynamic composition
+
+The natural generalization of `ProductTimestamp` to dynamic arities. Solves the hardest
+structural problem in the roadmap: a system with runtime topology changes (shards added/removed)
+cannot be modeled with fixed-arity tuples; `MapLattice` makes it expressible.
+
+**Partial order:** $M_1 \le M_2$ iff for every key $k$ in $M_1$, $V_{M_1}(k) \le V_{M_2}(k)$
+(missing keys are implicitly `Bottom` — no progress recorded yet).
+
+```rust
+pub struct MapLattice<K: Ord, V: Lattice> { map: BTreeMap<K, V> }
+
+impl<K: Ord + Clone, V: Lattice + Clone> Lattice for MapLattice<K, V> {
+    /// Union of keys; overlapping values take their join.
+    fn join(&self, other: &Self) -> Self { … }
+    /// Intersection of common keys; overlapping values take their meet.
+    fn meet(&self, other: &Self) -> Self { … }
+}
+```
+
+**Use-case:** A cluster scales from 10 shards to 100 shards at runtime. Each shard key appears
+in the map the moment it reports progress. Static tuples cannot accommodate this without
+recompilation.
+
+**Implementation:** `BTreeMap<K, V>` — no exotic dependencies; `alloc` only (compatible with
+`no_std`).
+
+**Bottom is the empty map.** No bottom element is required on `V`: `meet` = key-intersection with
+value-meet is a genuine greatest lower bound (a key present in only one map collapses to bottom and
+is simply dropped — its bottom value is never constructed), and `join` = key-union with value-join
+is the least upper bound. The empty map is the identity for `join` and absorbing for `meet`.
+This is why `MapLattice` has no hard dependency on 7.3 despite the "missing key = Bottom" framing.
+
+- [x] `MapLattice<K, V>` struct with `insert`, `get`, `keys`, `values`
+- [x] `Lattice` impl (join = key-union + value-join; meet = key-intersection + value-meet)
+- [x] `PartialOrd` impl following the point-wise definition
+- [x] Unit tests: insert, meet, join, empty-map edge cases
+- [x] Property tests: commutativity, associativity, idempotence **and the `PartialOrd`/`meet`
+      consistency law** (`a ≤ b ⟺ meet(a, b) == a`) — empty map as `join` identity and `meet`
+      absorber
+
+### 7.2 `SetLattice<T>` — powerset / set-inclusion order
+
+Tracks completion of discrete, unordered elements via subset inclusion. The partial order is
+$A \le B$ iff $A \subseteq B$. Meet is intersection; join is union.
+
+**Use-case:** A global configuration state is only advanced when the set of acknowledging nodes
+matches the expected cluster membership. Each node publishes its current acknowledgement set;
+the coordinator-free merge (meet = intersection) computes the universal acknowledgement.
+
+```rust
+pub struct SetLattice<T: Ord> { set: BTreeSet<T> }
+
+impl<T: Ord + Clone> Lattice for SetLattice<T> {
+    fn meet(&self, other: &Self) -> Self { /* intersection */ }
+    fn join(&self, other: &Self) -> Self { /* union */ }
+}
+```
+
+**Note:** Four lines of logic around `BTreeSet` — the value is the semantic contract and the
+property tests, not the complexity of the implementation.
+
+- [x] `SetLattice<T>` struct with `insert`, `contains`, `len`
+- [x] `Lattice` impl (meet = intersection; join = union)
+- [x] `PartialOrd` impl via `is_subset`
+- [x] Property tests: commutativity, associativity, idempotence
+
+### 7.3 `WithTop<T>` / `WithBottom<T>` — lifted bounding enums ← implement first
+
+Any lattice is structurally incomplete without explicit top/bottom elements. `WithTop` and
+`WithBottom` add structural EOF and pipeline sentinel values without magic constants like
+`u64::MAX`.
+
+**Invariant:**
+- `WithTop<T>`: adds a single `Top` element above all `Value(t)`. `Top` is absorbing for
+  `join` and the identity for `meet`. Does **not** carry a `Bottom` variant — compose with
+  `WithBottom` when both sentinels are needed.
+- `WithBottom<T>`: symmetric; adds a single `Bottom` element below all `Value(t)`. `Bottom` is
+  absorbing for `meet` and the identity for `join`.
+
+```rust
+pub enum WithTop<T>    { Value(T), Top }
+pub enum WithBottom<T> { Bottom, Value(T) }
+```
+
+**Use-case:** When an upstream ingestion source finishes, wrapping its final frontier element
+in `WithTop::Top` immediately signals downstream: *"this data path is permanently closed."*
+The `join` with any other frontier immediately absorbs to `Top`, short-circuiting progress
+calculation.
+
+**Design note:** `WithTop<WithBottom<T>>` composes to a three-element bounded lattice
+`Bottom < Value(t) < Top`. This is the correct way to lift any type to a closed bounded lattice
+without magic constants.
+
+- [x] `WithTop<T>` and `WithBottom<T>` enum types
+- [x] `PartialOrd`, `Lattice` impls for both
+- [x] `WithTop<WithBottom<T>>` composition example in docs
+- [x] Unit tests: Top absorbs join, Bottom absorbs meet, Value(t) round-trips
+- [x] Property tests: laws hold for `WithTop<u64>` and `WithBottom<u64>`
+
+### 7.4 `IntervalSetLattice<T>` — disjoint range aggregation (companion crate candidate)
+
+Tracks a canonicalized set of non-overlapping intervals to model out-of-order progress with
+gaps. Merging vectors of intervals automatically bridges overlapping bounds and resolves holes
+as missing elements arrive.
+
+**Lattice operations:**
+- `join(A, B)`: merge intervals, coalescing any overlaps → largest covered set
+- `meet(A, B)`: intersect intervals → smallest commonly covered set
+
+**Use-case:** A backfill engine processes blocks 150–200 while block 101 is still delayed.
+`IntervalSetLattice` tracks exactly what can be safely acknowledged without losing the gap.
+
+**Scope decision:** The interval-set canonicalization algorithm (split, merge, coalesce) is
+a non-trivial data structure. This is a **candidate for a companion crate**
+(`antichain-intervals`) rather than the core crate, keeping the core lean and `no_std`-simple.
+The decision should be made after 7.1–7.3 are complete and the performance characteristics are
+understood.
+
+- [ ] Prototype `IntervalSetLattice<T>` in a standalone module
+- [ ] Benchmark: coalesce cost at 1 000 and 100 000 disjoint intervals
+- [ ] Decide: core crate vs. `antichain-intervals` companion crate based on benchmark results
+- [ ] If companion: publish as `antichain-intervals = "0.1.0"` alongside core `0.3.0`
+
+---
+
+### Phase 7 summary table
+
+| Sub-phase | Type | Location | Depends on | Status |
+|-----------|------|----------|------------|--------|
+| 7.1 | `MapLattice<K, V>` | core | — | ✅ done |
+| 7.2 | `SetLattice<T>` | core | — | ✅ done |
+| 7.3 | `WithTop<T>` / `WithBottom<T>` | core | — | ✅ done |
+| 7.4 | `IntervalSetLattice<T>` | companion crate TBD | 7.1, 7.3 | deferred |
+
+---
+
+## Deferred — `SumOrder<A, B>` (post-Phase 7)
+
+`SumOrder<A, B>` models a coproduct of two incomparable time domains. It is mathematically
+correct but ergonomically expensive: users must wrap in `WithTop<WithBottom<SumOrder<A,B>>>`
+to get a closed lattice, and `less_equal` across variants is semantically murky. In practice,
+the same problems are almost always better solved by separate frontiers or a `MapLattice` with
+a discriminant key.
+
+Deferred until real usage in downstream crates demonstrates a genuine need that cannot be
+met by existing composition primitives. Candidate for a companion crate at that point.
+
+```rust
+pub enum SumOrder<A, B> { Left(A), Right(B) }
+// meet(Left(a), Right(b)) = Bottom (incomparable)
+// join(Left(a), Right(b)) = Top   (incomparable)
+// Requires WithTop<WithBottom<SumOrder<A,B>>> for a closed lattice.
+```
+
+---
+
+## Phase 8 — Performance & real-world validation
+
+**Goal:** stop adding expressiveness and prove the primitives are both *fast enough* and
+*sufficient* for a real downstream system. The open risk after Phase 7 is performance and
+validation, not more wrapper types — explicitly avoid adding further composition types to the core
+in this phase.
+
+### 8.1 Antichain width — close the Phase 3.3 critical-path question
+
+Phase 3.3 flagged width-explosion as the highest-risk performance question and Phase 4 added
+benchmarks (`benches/frontier.rs`), but the *results* were never converted into a guarantee.
+`Frontier::meet` is currently O(n²) in antichain width, and Phase 7's `MapLattice`/`SetLattice`
+introduce new ways for width to grow.
+
+- [ ] Turn the existing criterion benchmark output into a documented empirical bound (state it with
+      data, not assumption — as Phase 3.3 required).
+- [ ] If degradation is material, implement a compaction step on `meet`: projection-based dominance
+      elimination after the merge.
+- [ ] Re-run benchmarks with `MapLattice`/`SetLattice` element types to confirm the bound holds
+      under the Phase 7 structures.
+
+### 8.2 Downstream adapter crate — validate sufficiency
+
+The "strip domain contamination, keep the core pure" decision only pays off once something proves
+the core is actually enough. Build the first real adapter (e.g. the RockStream three-layer progress
+protocol) on top of the published core.
+
+- [ ] Implement an adapter crate that depends only on `antichain` (no reaching back into the core).
+- [ ] Confirm Phases 1–7 expose every primitive the adapter needs; record any genuine gaps.
+- [ ] Let real gaps — not speculation — decide whether `SumOrder` or `IntervalSetLattice` graduate
+      from deferred to implemented.
+
+### 8.3 Resolve Phase 6 design debt (see §6.4)
+
+- [ ] Decide `Min<T>`'s fate: keep as documentary newtype, or remove if downstream usage doesn't
+      justify the API surface.
+- [ ] Redesign `Bounded<T>`: move bounds to type level (const generics where feasible) or drop
+      per-instance bounds, and relax the `T: Ord` requirement to `PartialOrd` so it composes with
+      `ProductTimestamp` and the other composition types. Driven by 8.2's adapter needs.
+
+### Phase 8 summary table
+
+| Sub-phase | Focus | Output |
+|-----------|-------|--------|
+| 8.1 | `meet` width performance | Documented bound or compaction step |
+| 8.2 | Downstream adapter | Proof the core is sufficient; gap list |
+| 8.3 | Phase 6 design debt | `Min`/`Bounded` decisions resolved |
 
 ---
 
