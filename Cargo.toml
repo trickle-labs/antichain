@@ -1,12 +1,17 @@
 [package]
 name = "antichain"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
+rust-version = "1.85"
 description = "A coordinator-free primitive for tracking distributed progress using lattice algebra."
 license = "Apache-2.0"
 repository = "https://github.com/trickle-labs/antichain"
 keywords = ["distributed", "progress", "frontier", "lattice", "antichain"]
-categories = ["data-structures", "algorithms"]
+categories = ["data-structures", "algorithms", "concurrency", "no-std"]
+
+[workspace]
+members = ["crates/antichain-intervals"]
+exclude = ["fuzz"]
 
 [dependencies]
 serde = { version = "1", optional = true, default-features = false, features = ["derive"] }
@@ -14,11 +19,13 @@ serde = { version = "1", optional = true, default-features = false, features = [
 [dev-dependencies]
 proptest = "1"
 criterion = { version = "0.5", features = ["html_reports"] }
+serde_json = "1"
+antichain-intervals = { path = "crates/antichain-intervals" }
 
 [features]
 default = ["std"]
-std = []
-serde = ["dep:serde"]
+std = ["serde?/std"]
+serde = ["dep:serde", "serde/alloc"]
 
 [[bench]]
 name = "frontier"

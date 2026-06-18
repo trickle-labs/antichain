@@ -18,8 +18,10 @@
 | 4 | Hardening | Benchmarks, fuzzing, docs, `#![no_std]` compat | Crate is publishable |
 | 5 | Formal specification | TLA⁺ or Lean proof of convergence | Spec written, convergence proven |
 | 6 | Extended composition patterns | Additional useful partial orders | ✅ `Max<T>`, `Min<T>`, `Bounded<T>` working |
-| 7 | Advanced structural & dynamic lattices | Dynamic, lifted, and set-based orders | ✅ `MapLattice`, `SetLattice`, `WithTop`/`WithBottom` in core; `IntervalSetLattice` deferred to companion crate; `SumOrder` deferred |
+| 7 | Advanced structural & dynamic lattices | Dynamic, lifted, and set-based orders | ✅ `MapLattice`, `SetLattice`, `WithTop`/`WithBottom` in core; `IntervalSetLattice` shipped in Phase 9 companion crate; `SumOrder` deferred |
 | 8 | Performance & real-world validation | Compaction, benchmarked width bounds, downstream adapter | ✅ `meet` width bound documented; adapter example validates sufficiency; Phase 6 design debt resolved |
+| 9 | Adoption, expressiveness & hardening | Cookbook, companion crate, perf, ecosystem | ✅ Cookbook + universal consistency law; `antichain-intervals`; inline storage; MSRV/semver/no_std CI; `serde` feature fixed |
+| 10 | Onboarding & ecosystem reach | Tutorial, runnable examples, diagrams, prior-art context | ✅ Tutorial; `watermark_gossip` + `backfill_gaps` examples; `comparison.md`; `0.3.0` |
 
 ---
 
@@ -476,7 +478,7 @@ understood.
 | 7.1 | `MapLattice<K, V>` | core | — | ✅ done |
 | 7.2 | `SetLattice<T>` | core | — | ✅ done |
 | 7.3 | `WithTop<T>` / `WithBottom<T>` | core | — | ✅ done |
-| 7.4 | `IntervalSetLattice<T>` | companion crate TBD | 7.1, 7.3 | deferred |
+| 7.4 | `IntervalSetLattice<T>` | companion crate TBD | 7.1, 7.3 | ✅ shipped in Phase 9 |
 
 ---
 
@@ -569,6 +571,142 @@ protocol) on top of the published core.
 | 8.1 | `meet` width performance | ✅ Documented bound; no compaction needed |
 | 8.2 | Downstream adapter | ✅ `examples/progress_protocol.rs` proves core sufficient |
 | 8.3 | Phase 6 design debt | ✅ `Min<T>` kept; `Bounded<T>` relaxed to `PartialOrd` |
+
+---
+
+## Phase 9 — Adoption, expressiveness & hardening
+
+**Goal:** with the core proven and benchmarked, lower the barrier to adoption, ship the one
+deferred type with a real use-case, remove the last performance footgun, and harden the
+release/CI surface. **Avoid adding new core types** — Phase 9 is about polish, not expansion.
+
+### 9.1 Documentation for adoption ✅
+
+- [x] **Cookbook** ([`docs/cookbook.md`](docs/cookbook.md)): a task-oriented decision table
+      (*"which type for which problem"*) with a worked recipe per public type. Every code block
+      is compiled and run as a doctest via a `#[cfg(doctest)]` include, so the guide cannot rot.
+- [x] **`CHANGELOG.md`** following Keep a Changelog, back-filled to `0.1.0`.
+
+### 9.2 Universal consistency law ✅
+
+- [x] The connecting lemma `a ≤ b ⟺ meet(a,b)==a ⟺ join(a,b)==b` is now property-tested in
+      **both** directions for **every** lattice type, not just the forward direction on a subset.
+      The bare tuple `(A, B)` is deliberately excluded (component-wise meet is not a GLB under
+      lexicographic `PartialOrd`) — which is exactly why product-order use cases must use
+      `ProductTimestamp`.
+
+### 9.3 `IntervalSetLattice` companion crate ✅
+
+- [x] Shipped the deferred Phase 7.4 type as **`antichain-intervals`** (workspace member,
+      `crates/antichain-intervals`). Canonical disjoint half-open intervals; `meet` = intersection
+      (two-pointer sweep), `join` = coalescing union. Implements `antichain::Lattice`, so it drops
+      into a `Frontier` or a `MapLattice` value.
+- [x] Property-tested against a brute-force point-set oracle (meet = point intersection,
+      join = point union) and the universal consistency law. `no_std` + `serde` supported.
+
+### 9.4 Performance — inline antichain storage ✅
+
+- [x] `Antichain<T>` stores width-0 and width-1 sets **inline with zero heap allocation**; only
+      genuinely partially-ordered antichains of width ≥ 2 spill to a `Vec`. `Frontier<u64>` (and
+      any totally-ordered timestamp) now never allocates. `retain` renormalizes back down so a
+      shrinking antichain returns to allocation-free storage.
+- [x] Serde wire format preserved exactly (`{ "elements": [...] }`); locked by round-trip tests.
+- [x] New `frontier_u64_churn` benchmark exercises the allocation-free width-1 fast path
+      (~5 ns per merge).
+
+### 9.5 Ecosystem hardening ✅
+
+- [x] **Fixed a latent bug:** the `serde` feature never enabled serde's `alloc` collection impls,
+      so `--features serde` was uncompilable (`MapLattice`/`SetLattice` derives). Now wired
+      correctly with the required `Ord` deserialize bounds; round-trip tests prevent regression.
+- [x] `#![forbid(unsafe_code)]` and `#![deny(missing_docs)]` on both crates.
+- [x] MSRV policy (`rust-version = "1.85"`); CI jobs for `no_std` builds, MSRV `cargo check`, and
+      `cargo-semver-checks`; clippy/test extended to `--workspace`.
+
+### Phase 9 summary table
+
+| Sub-phase | Focus | Output |
+|-----------|-------|--------|
+| 9.1 | Adoption docs | ✅ Cookbook (doctested) + `CHANGELOG.md` |
+| 9.2 | Consistency law | ✅ Biconditional, both directions, every type |
+| 9.3 | `IntervalSetLattice` | ✅ `antichain-intervals` companion crate |
+| 9.4 | Performance | ✅ Inline storage; allocation-free width-1 |
+| 9.5 | Hardening | ✅ serde fix; unsafe/docs lints; MSRV/semver/no_std CI |
+
+---
+
+## Phase 10 — Onboarding & ecosystem reach
+
+**Goal:** the core is correct, proven, benchmarked, and published. The remaining risk is *not*
+technical — it is **adoption**. A primitive nobody understands gets reinvented. Phase 10 lowers
+the conceptual barrier to entry and situates the crate in the broader ecosystem. **No new core
+types** — this phase is purely docs, examples, and outreach.
+
+**Sequencing rationale:** 10.1 (welcoming README) is the front door and ships first; everything
+else deepens the path a new reader takes after it. 10.2 and 10.3 are independent. 10.4 is best
+written last, once the examples it references exist.
+
+### 10.1 A welcoming front door — README rewrite ✅
+
+- [x] Lead with a plain-language "30-second version" and a concrete worker-merge scenario before
+      any lattice vocabulary. Move the theory *below* the motivation, not above it.
+- [x] Add a Mermaid diagram showing three workers merging to a single global frontier.
+- [x] Add a "When should I reach for this?" section mapping real situations (stream watermarks,
+      replication, backfill, quorum, multi-dimensional time) to the crate.
+- [x] Surface the full type toolbox as a decision table that links into the cookbook.
+
+### 10.2 A narrative tutorial — "from one number to a frontier"
+
+The cookbook is a *reference* ("which type for which problem"). It assumes you already know you
+need a lattice. A new reader needs a *narrative* that builds the intuition from scratch.
+
+- [x] `docs/tutorial.md`: a single worked story that starts with a naive coordinator + global
+      counter, shows where it bottlenecks, then refactors step-by-step to a coordinator-free
+      `Frontier` merge — introducing `meet`, the antichain invariant, and product order only as
+      the story demands them.
+- [x] Every code block compiled as a doctest (same `#[cfg(doctest)]` include pattern as the
+      cookbook) so the tutorial cannot rot.
+- [x] Link it from the README "Learn more" section above the cookbook.
+
+### 10.3 Runnable, real-world examples
+
+`examples/progress_protocol.rs` proves *sufficiency* but reads like a test. Add examples a
+newcomer can `cargo run` and watch.
+
+- [x] `examples/watermark_gossip.rs`: N simulated workers exchanging frontiers in random order
+      over an in-memory "lossy channel," printing convergence to the same global watermark —
+      a runnable demonstration of the convergence theorem.
+- [x] `examples/backfill_gaps.rs`: a backfill scenario using `antichain-intervals` where blocks
+      arrive out of order and the safe-acknowledged interval set advances as holes fill.
+- [x] Each example carries a top-of-file doc comment explaining what to watch for in the output.
+
+### 10.4 Prior art & positioning
+
+Readers evaluating the crate will ask "how is this different from timely-dataflow's antichain,
+or from a CRDT library?" Answer it explicitly so the crate isn't dismissed as a reinvention.
+
+- [x] `docs/comparison.md`: short, fair comparison to (a) timely/differential-dataflow's
+      `Antichain`/`Frontier` (this crate is standalone, `no_std`, dependency-light, and
+      composition-first), and (b) CRDTs (same algebraic foundation, applied to *progress* not
+      *data*). State what each is better at — no strawmen.
+- [x] A one-paragraph "Prior art" note in the README linking to it.
+
+### 10.5 Release & discoverability
+
+- [x] Publish the current `Unreleased` changelog as `0.3.0` (companion crate `antichain-intervals`
+      `0.1.0`) once Phase 10 docs land.
+- [x] Add crate `keywords`/`categories` (`data-structures`, `concurrency`, `no-std`) to both
+      `Cargo.toml`s for crates.io discoverability; verify `cargo publish --dry-run` is clean.
+
+### Phase 10 summary table
+
+| Sub-phase | Focus | Output |
+|-----------|-------|--------|
+| 10.1 | Welcoming README | ✅ Rewritten front door + diagram + decision table |
+| 10.2 | Narrative tutorial | ✅ `docs/tutorial.md` (doctested) |
+| 10.3 | Runnable examples | ✅ `watermark_gossip`, `backfill_gaps` |
+| 10.4 | Prior-art positioning | ✅ `docs/comparison.md` |
+| 10.5 | Release & discoverability | ✅ `0.3.0`, crates.io metadata |
 
 ---
 

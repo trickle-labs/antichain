@@ -25,9 +25,20 @@ checksum = "940b3a0ca603d1eade50a4846a2afffd5ef57a9feac2c0e2ec2e14f9ead76000"
 
 [[package]]
 name = "antichain"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
+ "antichain-intervals",
  "criterion",
+ "proptest",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "antichain-intervals"
+version = "0.1.0"
+dependencies = [
+ "antichain",
  "proptest",
  "serde",
 ]

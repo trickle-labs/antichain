@@ -126,19 +126,34 @@
 //!   [`MapLattice`] key rather than widening the antichain.
 
 #![cfg_attr(not(feature = "std"), no_std)]
+#![forbid(unsafe_code)]
+#![deny(missing_docs)]
 
 #[cfg(not(feature = "std"))]
 extern crate alloc;
 
-#[cfg(not(feature = "std"))]
+// `Vec` at the crate root is referenced by the serde deserialize helper and by
+// the test modules; the `vec!` macro is used only by tests.
+#[cfg(all(not(feature = "std"), test))]
 use alloc::vec;
-#[cfg(not(feature = "std"))]
+#[cfg(all(not(feature = "std"), any(test, feature = "serde")))]
 use alloc::vec::Vec;
 
-#[cfg(feature = "std")]
-use std::collections::{BTreeMap, BTreeSet};
 #[cfg(not(feature = "std"))]
 use alloc::collections::{BTreeMap, BTreeSet};
+#[cfg(feature = "std")]
+use std::collections::{BTreeMap, BTreeSet};
+
+// Compile and run every code block in the cookbook as a doctest. The item only
+// exists under `cargo test --doc`, so it never appears in the generated API docs.
+#[cfg(doctest)]
+#[doc = include_str!("../docs/cookbook.md")]
+pub struct Cookbook;
+
+// Compile and run every code block in the tutorial as a doctest.
+#[cfg(doctest)]
+#[doc = include_str!("../docs/tutorial.md")]
+pub struct Tutorial;
 
 // ── Lattice ───────────────────────────────────────────────────────────────────
 
@@ -148,7 +163,9 @@ use alloc::collections::{BTreeMap, BTreeSet};
 /// - `meet(a, b) <= a` and `meet(a, b) <= b`
 /// - `a <= join(a, b)` and `b <= join(a, b)`
 pub trait Lattice: PartialOrd {
+    /// Returns the greatest lower bound of `self` and `other`.
     fn meet(&self, other: &Self) -> Self;
+    /// Returns the least upper bound of `self` and `other`.
     fn join(&self, other: &Self) -> Self;
 }
 
@@ -203,7 +220,9 @@ impl<A: Lattice + Clone, B: Lattice + Clone> Lattice for (A, B) {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ProductTimestamp<T1, T2> {
+    /// The first (outer) dimension.
     pub outer: T1,
+    /// The second (inner) dimension.
     pub inner: T2,
 }
 
@@ -260,7 +279,9 @@ impl<T1: Lattice + Clone, T2: Lattice + Clone> Lattice for ProductTimestamp<T1, 
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Lexicographic<A, B> {
+    /// The outer dimension, which totally dominates the ordering.
     pub outer: A,
+    /// The inner dimension, which breaks ties when outer values are equal.
     pub inner: B,
 }
 
@@ -303,16 +324,129 @@ impl<A: Ord + Clone, B: Lattice + Clone> Lattice for Lexicographic<A, B> {
     }
 }
 
+// ── Antichain storage ─────────────────────────────────────────────────────────
+
+mod storage {
+    #[cfg(not(feature = "std"))]
+    use alloc::vec::Vec;
+    #[cfg(feature = "std")]
+    use std::vec::Vec;
+
+    /// Inline storage for an antichain's elements.
+    ///
+    /// The overwhelmingly common cases are width 0 (an unconstrained frontier) and
+    /// width 1 (any totally-ordered timestamp such as `u64`, which always collapses
+    /// to its minimum). Both are held inline with **zero heap allocation**; only
+    /// genuinely partially-ordered antichains of width ≥ 2 spill to a `Vec`.
+    ///
+    /// `retain` renormalizes back down to `One`/`Zero` so an antichain that shrinks
+    /// returns to allocation-free storage.
+    #[derive(Clone, Debug)]
+    pub(crate) enum Inline<T> {
+        Zero,
+        One(T),
+        Many(Vec<T>),
+    }
+
+    impl<T> Inline<T> {
+        #[inline]
+        pub(crate) fn new() -> Self {
+            Inline::Zero
+        }
+
+        #[inline]
+        pub(crate) fn one(t: T) -> Self {
+            Inline::One(t)
+        }
+
+        /// Builds inline storage from a `Vec`, used only by the serde deserialize
+        /// path (other construction goes through `new`/`one`/`push`).
+        #[cfg(feature = "serde")]
+        pub(crate) fn from_vec(v: Vec<T>) -> Self {
+            match v.len() {
+                0 => Inline::Zero,
+                1 => Inline::One(v.into_iter().next().expect("len checked == 1")),
+                _ => Inline::Many(v),
+            }
+        }
+
+        #[inline]
+        pub(crate) fn as_slice(&self) -> &[T] {
+            match self {
+                Inline::Zero => &[],
+                Inline::One(t) => core::slice::from_ref(t),
+                Inline::Many(v) => v.as_slice(),
+            }
+        }
+
+        #[inline]
+        pub(crate) fn len(&self) -> usize {
+            match self {
+                Inline::Zero => 0,
+                Inline::One(_) => 1,
+                Inline::Many(v) => v.len(),
+            }
+        }
+
+        #[inline]
+        pub(crate) fn is_empty(&self) -> bool {
+            matches!(self, Inline::Zero)
+        }
+
+        #[inline]
+        pub(crate) fn iter(&self) -> core::slice::Iter<'_, T> {
+            self.as_slice().iter()
+        }
+
+        pub(crate) fn push(&mut self, t: T) {
+            match self {
+                Inline::Zero => *self = Inline::One(t),
+                Inline::One(_) => {
+                    let first = match core::mem::replace(self, Inline::Zero) {
+                        Inline::One(x) => x,
+                        _ => unreachable!("matched One above"),
+                    };
+                    *self = Inline::Many(Vec::from([first, t]));
+                }
+                Inline::Many(v) => v.push(t),
+            }
+        }
+
+        pub(crate) fn retain<F: FnMut(&T) -> bool>(&mut self, mut f: F) {
+            match self {
+                Inline::Zero => {}
+                Inline::One(t) => {
+                    if !f(t) {
+                        *self = Inline::Zero;
+                    }
+                }
+                Inline::Many(v) => {
+                    v.retain(|e| f(e));
+                    // Renormalize so a shrunken antichain returns to allocation-free storage.
+                    match v.len() {
+                        0 => *self = Inline::Zero,
+                        1 => *self = Inline::One(v.pop().expect("len checked == 1")),
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+}
+
 // ── Antichain ─────────────────────────────────────────────────────────────────
 
 /// A set of mutually incomparable elements under `PartialOrd`.
 ///
 /// Invariant: no element `x` in the set satisfies `x <= y` or `y <= x`
 /// for any other element `y` in the set.
+///
+/// Width-0 and width-1 antichains are stored inline without heap allocation. For
+/// totally-ordered timestamps (e.g. `Frontier<u64>`) the antichain always stays at
+/// width 1, so it never allocates.
 #[derive(Clone, Debug)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Antichain<T> {
-    elements: Vec<T>,
+    elements: storage::Inline<T>,
 }
 
 /// Two antichains are equal when they contain the same *set* of elements,
@@ -320,23 +454,54 @@ pub struct Antichain<T> {
 impl<T: PartialEq> PartialEq for Antichain<T> {
     fn eq(&self, other: &Self) -> bool {
         self.elements.len() == other.elements.len()
-            && self.elements.iter().all(|e| other.elements.contains(e))
+            && self
+                .elements
+                .iter()
+                .all(|e| other.elements.as_slice().contains(e))
     }
 }
 
 impl<T: Eq> Eq for Antichain<T> {}
 
+/// Serializes as `{ "elements": [...] }` — identical to the previous derived
+/// representation, so the inline-storage optimization is wire-compatible.
+#[cfg(feature = "serde")]
+impl<T: serde::Serialize> serde::Serialize for Antichain<T> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut state = serializer.serialize_struct("Antichain", 1)?;
+        state.serialize_field("elements", self.elements.as_slice())?;
+        state.end()
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de, T: serde::Deserialize<'de>> serde::Deserialize<'de> for Antichain<T> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(serde::Deserialize)]
+        struct Helper<T> {
+            elements: Vec<T>,
+        }
+        let helper = Helper::deserialize(deserializer)?;
+        Ok(Antichain {
+            elements: storage::Inline::from_vec(helper.elements),
+        })
+    }
+}
+
 impl<T: PartialOrd + Clone> Antichain<T> {
     /// Creates an empty antichain.
     pub fn empty() -> Self {
         Self {
-            elements: Vec::new(),
+            elements: storage::Inline::new(),
         }
     }
 
     /// Creates an antichain containing a single element.
     pub fn from_elem(t: T) -> Self {
-        Self { elements: vec![t] }
+        Self {
+            elements: storage::Inline::one(t),
+        }
     }
 
     /// Inserts `t`, maintaining the antichain invariant.
@@ -356,7 +521,7 @@ impl<T: PartialOrd + Clone> Antichain<T> {
 
     /// Returns the elements of the antichain as a slice.
     pub fn elements(&self) -> &[T] {
-        &self.elements
+        self.elements.as_slice()
     }
 
     /// Returns the number of elements.
@@ -1504,7 +1669,11 @@ impl<T: Lattice + Clone> Lattice for Bounded<T> {
         } else {
             v
         };
-        Bounded { value: v, min: self.min.clone(), max: self.max.clone() }
+        Bounded {
+            value: v,
+            min: self.min.clone(),
+            max: self.max.clone(),
+        }
     }
 
     fn join(&self, other: &Self) -> Self {
@@ -1516,7 +1685,11 @@ impl<T: Lattice + Clone> Lattice for Bounded<T> {
         } else {
             v
         };
-        Bounded { value: v, min: self.min.clone(), max: self.max.clone() }
+        Bounded {
+            value: v,
+            min: self.min.clone(),
+            max: self.max.clone(),
+        }
     }
 }
 
@@ -1670,14 +1843,8 @@ mod tests_phase6 {
     #[test]
     fn nested_product_bounded_outer() {
         // Frontier<ProductTimestamp<Bounded<u64>, u64>>: bounded outer, unbounded inner.
-        let f1 = Frontier::from_elem(ProductTimestamp::new(
-            Bounded::new(3u64, 0, 10),
-            100u64,
-        ));
-        let f2 = Frontier::from_elem(ProductTimestamp::new(
-            Bounded::new(7u64, 0, 10),
-            50u64,
-        ));
+        let f1 = Frontier::from_elem(ProductTimestamp::new(Bounded::new(3u64, 0, 10), 100u64));
+        let f2 = Frontier::from_elem(ProductTimestamp::new(Bounded::new(7u64, 0, 10), 50u64));
         // (3, 100) and (7, 50) are incomparable in product order → both survive meet.
         let merged = f1.meet(&f2);
         assert_eq!(merged.elements().len(), 2);
@@ -2048,6 +2215,10 @@ impl<T: Lattice + Clone> Lattice for WithBottom<T> {
 /// ```
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(
+    feature = "serde",
+    serde(bound(deserialize = "K: Ord + serde::Deserialize<'de>, V: serde::Deserialize<'de>"))
+)]
 pub struct MapLattice<K, V> {
     map: BTreeMap<K, V>,
 }
@@ -2055,7 +2226,9 @@ pub struct MapLattice<K, V> {
 impl<K: Ord, V> MapLattice<K, V> {
     /// Creates an empty `MapLattice` (the bottom element of the lattice).
     pub fn new() -> Self {
-        Self { map: BTreeMap::new() }
+        Self {
+            map: BTreeMap::new(),
+        }
     }
 
     /// Inserts or replaces the value for `key`, returning the previous value if any.
@@ -2106,12 +2279,14 @@ impl<K: Ord, V: Eq> Eq for MapLattice<K, V> {}
 impl<K: Ord, V: PartialOrd> PartialOrd for MapLattice<K, V> {
     /// `M₁ ≤ M₂` iff every key `k` in `M₁` is present in `M₂` with `M₁[k] ≤ M₂[k]`.
     fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
-        let self_le = self.map.iter().all(|(k, v)| {
-            other.map.get(k).map_or(false, |ov| v <= ov)
-        });
-        let other_le = other.map.iter().all(|(k, v)| {
-            self.map.get(k).map_or(false, |sv| v <= sv)
-        });
+        let self_le = self
+            .map
+            .iter()
+            .all(|(k, v)| other.map.get(k).is_some_and(|ov| v <= ov));
+        let other_le = other
+            .map
+            .iter()
+            .all(|(k, v)| self.map.get(k).is_some_and(|sv| v <= sv));
         match (self_le, other_le) {
             (true, true) => Some(core::cmp::Ordering::Equal),
             (true, false) => Some(core::cmp::Ordering::Less),
@@ -2186,6 +2361,10 @@ impl<K: Ord + Clone, V: Lattice + Clone> Lattice for MapLattice<K, V> {
 /// ```
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(
+    feature = "serde",
+    serde(bound(deserialize = "T: Ord + serde::Deserialize<'de>"))
+)]
 pub struct SetLattice<T> {
     set: BTreeSet<T>,
 }
@@ -2193,7 +2372,9 @@ pub struct SetLattice<T> {
 impl<T: Ord> SetLattice<T> {
     /// Creates an empty `SetLattice` (the bottom element of the lattice).
     pub fn new() -> Self {
-        Self { set: BTreeSet::new() }
+        Self {
+            set: BTreeSet::new(),
+        }
     }
 
     /// Inserts `value` into the set. Returns `true` if the value was not already present.
@@ -2253,11 +2434,15 @@ impl<T: Ord> PartialOrd for SetLattice<T> {
 impl<T: Ord + Clone> Lattice for SetLattice<T> {
     /// Intersection — the greatest lower bound under set inclusion.
     fn meet(&self, other: &Self) -> Self {
-        Self { set: self.set.intersection(&other.set).cloned().collect() }
+        Self {
+            set: self.set.intersection(&other.set).cloned().collect(),
+        }
     }
     /// Union — the least upper bound under set inclusion.
     fn join(&self, other: &Self) -> Self {
-        Self { set: self.set.union(&other.set).cloned().collect() }
+        Self {
+            set: self.set.union(&other.set).cloned().collect(),
+        }
     }
 }
 
@@ -2430,8 +2615,8 @@ mod tests_phase7 {
 
         let m = a.meet(&b);
         assert_eq!(m.get(&"x"), Some(&7)); // min(10, 7)
-        assert_eq!(m.get(&"y"), None);     // not in b
-        assert_eq!(m.get(&"z"), None);     // not in a
+        assert_eq!(m.get(&"y"), None); // not in b
+        assert_eq!(m.get(&"z"), None); // not in a
     }
 
     #[test]
@@ -2445,8 +2630,8 @@ mod tests_phase7 {
 
         let j = a.join(&b);
         assert_eq!(j.get(&"x"), Some(&10)); // max(10, 7)
-        assert_eq!(j.get(&"y"), Some(&5));  // only in a
-        assert_eq!(j.get(&"z"), Some(&3));  // only in b
+        assert_eq!(j.get(&"y"), Some(&5)); // only in a
+        assert_eq!(j.get(&"z"), Some(&3)); // only in b
     }
 
     #[test]
@@ -2475,7 +2660,10 @@ mod tests_phase7 {
         let mut nonempty: MapLattice<u64, u64> = MapLattice::new();
         nonempty.insert(1, 5);
         assert!(empty <= nonempty);
-        assert!(!(nonempty <= empty));
+        assert_eq!(
+            nonempty.partial_cmp(&empty),
+            Some(core::cmp::Ordering::Greater)
+        );
     }
 
     #[test]
@@ -2487,7 +2675,7 @@ mod tests_phase7 {
         b.insert(2, 5);
         // a <= b: a's key {1} ⊆ b's keys {1,2}, and a[1]=3 <= b[1]=7
         assert!(a <= b);
-        assert!(!(b <= a));
+        assert_eq!(b.partial_cmp(&a), Some(core::cmp::Ordering::Greater));
     }
 
     #[test]
@@ -2583,7 +2771,10 @@ mod tests_phase7 {
         let mut nonempty: SetLattice<u64> = SetLattice::new();
         nonempty.insert(1);
         assert!(empty <= nonempty);
-        assert!(!(nonempty <= empty));
+        assert_eq!(
+            nonempty.partial_cmp(&empty),
+            Some(core::cmp::Ordering::Greater)
+        );
     }
 
     #[test]
@@ -2594,7 +2785,7 @@ mod tests_phase7 {
         sup.insert(1);
         sup.insert(2);
         assert!(sub <= sup);
-        assert!(!(sup <= sub));
+        assert_eq!(sup.partial_cmp(&sub), Some(core::cmp::Ordering::Greater));
     }
 
     #[test]
@@ -2748,12 +2939,11 @@ mod prop_tests_phase7 {
         fn prop_with_top_meet_consistency(
             a in arb_with_top_u64(), b in arb_with_top_u64()
         ) {
-            if let Some(ord) = a.partial_cmp(&b) {
-                if ord.is_le() {
+            if let Some(ord) = a.partial_cmp(&b)
+                && ord.is_le() {
                     prop_assert_eq!(a.meet(&b), a.clone());
                     prop_assert_eq!(a.join(&b), b.clone());
                 }
-            }
         }
 
         /// meet is always a lower bound: meet(a, b) ≤ a and meet(a, b) ≤ b.
@@ -2804,12 +2994,11 @@ mod prop_tests_phase7 {
         fn prop_with_bottom_meet_consistency(
             a in arb_with_bottom_u64(), b in arb_with_bottom_u64()
         ) {
-            if let Some(ord) = a.partial_cmp(&b) {
-                if ord.is_le() {
+            if let Some(ord) = a.partial_cmp(&b)
+                && ord.is_le() {
                     prop_assert_eq!(a.meet(&b), a.clone());
                     prop_assert_eq!(a.join(&b), b.clone());
                 }
-            }
         }
 
         // ── MapLattice<u64, u64>: Lattice laws ───────────────────────────────
@@ -2859,12 +3048,11 @@ mod prop_tests_phase7 {
         fn prop_map_lattice_meet_consistency(
             a in arb_map_lattice(), b in arb_map_lattice()
         ) {
-            if let Some(ord) = a.partial_cmp(&b) {
-                if ord.is_le() {
+            if let Some(ord) = a.partial_cmp(&b)
+                && ord.is_le() {
                     prop_assert_eq!(a.meet(&b), a.clone());
                     prop_assert_eq!(a.join(&b), b.clone());
                 }
-            }
         }
 
         /// meet is always a lower bound.
@@ -2874,8 +3062,8 @@ mod prop_tests_phase7 {
         ) {
             let m = a.meet(&b);
             // m <= a and m <= b (partial_cmp returns Some(Less) or Some(Equal))
-            prop_assert!(m.partial_cmp(&a).map_or(false, |o| o.is_le()));
-            prop_assert!(m.partial_cmp(&b).map_or(false, |o| o.is_le()));
+            prop_assert!(m.partial_cmp(&a).is_some_and(|o| o.is_le()));
+            prop_assert!(m.partial_cmp(&b).is_some_and(|o| o.is_le()));
         }
 
         /// join is always an upper bound.
@@ -2884,8 +3072,8 @@ mod prop_tests_phase7 {
             a in arb_map_lattice(), b in arb_map_lattice()
         ) {
             let j = a.join(&b);
-            prop_assert!(a.partial_cmp(&j).map_or(false, |o| o.is_le()));
-            prop_assert!(b.partial_cmp(&j).map_or(false, |o| o.is_le()));
+            prop_assert!(a.partial_cmp(&j).is_some_and(|o| o.is_le()));
+            prop_assert!(b.partial_cmp(&j).is_some_and(|o| o.is_le()));
         }
 
         // ── SetLattice<u64>: Lattice laws ─────────────────────────────────────
@@ -2933,12 +3121,11 @@ mod prop_tests_phase7 {
         fn prop_set_lattice_meet_consistency(
             a in arb_set_lattice(), b in arb_set_lattice()
         ) {
-            if let Some(ord) = a.partial_cmp(&b) {
-                if ord.is_le() {
+            if let Some(ord) = a.partial_cmp(&b)
+                && ord.is_le() {
                     prop_assert_eq!(a.meet(&b), a.clone());
                     prop_assert_eq!(a.join(&b), b.clone());
                 }
-            }
         }
 
         /// meet is always a lower bound under set inclusion.
@@ -2947,8 +3134,8 @@ mod prop_tests_phase7 {
             a in arb_set_lattice(), b in arb_set_lattice()
         ) {
             let m = a.meet(&b);
-            prop_assert!(m.partial_cmp(&a).map_or(false, |o| o.is_le()));
-            prop_assert!(m.partial_cmp(&b).map_or(false, |o| o.is_le()));
+            prop_assert!(m.partial_cmp(&a).is_some_and(|o| o.is_le()));
+            prop_assert!(m.partial_cmp(&b).is_some_and(|o| o.is_le()));
         }
     }
 }
@@ -2982,9 +3169,7 @@ mod tests_phase8 {
     #[test]
     fn frontier_product_timestamp_width_equals_incomparable_count() {
         let width = 100u64;
-        let f = Frontier::from_elements(
-            (0..width).map(|i| ProductTimestamp::new(i, width - i)),
-        );
+        let f = Frontier::from_elements((0..width).map(|i| ProductTimestamp::new(i, width - i)));
         assert_eq!(f.elements().len() as u64, width);
     }
 
@@ -2998,8 +3183,16 @@ mod tests_phase8 {
         let p_min = ProductTimestamp::new(0u64, 0u64);
         let p_max = ProductTimestamp::new(10u64, 10u64);
 
-        let b1 = Bounded::new(ProductTimestamp::new(3u64, 7u64), p_min.clone(), p_max.clone());
-        let b2 = Bounded::new(ProductTimestamp::new(5u64, 2u64), p_min.clone(), p_max.clone());
+        let b1 = Bounded::new(
+            ProductTimestamp::new(3u64, 7u64),
+            p_min.clone(),
+            p_max.clone(),
+        );
+        let b2 = Bounded::new(
+            ProductTimestamp::new(5u64, 2u64),
+            p_min.clone(),
+            p_max.clone(),
+        );
 
         // Component-wise meet: (min(3,5), min(7,2)) = (3, 2)
         let m = b1.meet(&b2);
@@ -3020,10 +3213,14 @@ mod tests_phase8 {
         let p_max = ProductTimestamp::new(100u64, 100u64);
 
         let f1 = Frontier::from_elem(Bounded::new(
-            ProductTimestamp::new(30u64, 70u64), p_min.clone(), p_max.clone(),
+            ProductTimestamp::new(30u64, 70u64),
+            p_min.clone(),
+            p_max.clone(),
         ));
         let f2 = Frontier::from_elem(Bounded::new(
-            ProductTimestamp::new(50u64, 20u64), p_min.clone(), p_max.clone(),
+            ProductTimestamp::new(50u64, 20u64),
+            p_min.clone(),
+            p_max.clone(),
         ));
 
         // (30,70) and (50,20) are incomparable in product order → both survive meet
@@ -3049,5 +3246,249 @@ mod tests_phase8 {
         let merged = f1.meet(&f2);
         assert_eq!(merged.elements()[0].0, Max(8u64));
         assert_eq!(merged.elements()[0].1, Min(15u64));
+    }
+}
+
+// ── Universal lattice consistency law ─────────────────────────────────────────
+//
+// The "connecting lemma": in a genuine lattice the partial order and the
+// meet/join operations are two faces of the same structure, linked by
+//
+//     a ≤ b   ⟺   meet(a, b) == a   ⟺   join(a, b) == b.
+//
+// Earlier phase modules check only the *forward* direction (a ≤ b ⟹ meet == a)
+// and only for a subset of types. This module verifies the **biconditional** in
+// **both** directions for **every** lattice type the crate exposes — the single
+// strongest correctness statement tying `PartialOrd` to `Lattice`.
+//
+// The bare tuple `(A, B)` is deliberately excluded: its `Lattice` impl is
+// component-wise while its `PartialOrd` is lexicographic, so component-wise meet
+// is *not* the greatest lower bound under that order (documented at the impl).
+// The law genuinely does not hold there, which is exactly why product-order use
+// cases must reach for `ProductTimestamp` instead.
+#[cfg(test)]
+mod prop_tests_consistency {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// Asserts the biconditional consistency law for one `(a, b)` pair.
+    ///
+    /// Checks both directions:
+    /// - `a ≤ b ⟺ meet(a, b) == a`
+    /// - `a ≤ b ⟺ join(a, b) == b`
+    fn check<T>(a: &T, b: &T) -> Result<(), TestCaseError>
+    where
+        T: Lattice + PartialEq + Clone + core::fmt::Debug,
+    {
+        let le = matches!(a.partial_cmp(b), Some(o) if o.is_le());
+        let meet_is_a = &a.meet(b) == a;
+        let join_is_b = &a.join(b) == b;
+        prop_assert_eq!(
+            le,
+            meet_is_a,
+            "a ≤ b ⟺ meet(a,b)==a violated for {:?}, {:?}",
+            a,
+            b
+        );
+        prop_assert_eq!(
+            le,
+            join_is_b,
+            "a ≤ b ⟺ join(a,b)==b violated for {:?}, {:?}",
+            a,
+            b
+        );
+        Ok(())
+    }
+
+    // ── Strategies ────────────────────────────────────────────────────────────
+
+    prop_compose! {
+        fn arb_product()(x in any::<u64>(), y in any::<u64>()) -> ProductTimestamp<u64, u64> {
+            ProductTimestamp::new(x, y)
+        }
+    }
+
+    prop_compose! {
+        fn arb_lexicographic()(x in any::<u64>(), y in any::<u64>()) -> Lexicographic<u64, u64> {
+            Lexicographic::new(x, y)
+        }
+    }
+
+    prop_compose! {
+        // Fixed bounds keep the operation well-defined: mixing ranges is undefined by design.
+        fn arb_bounded()(v in 0u64..=100) -> Bounded<u64> {
+            Bounded::new(v, 0, 100)
+        }
+    }
+
+    prop_compose! {
+        fn arb_with_top()(is_top in any::<bool>(), v in any::<u64>()) -> WithTop<u64> {
+            if is_top { WithTop::Top } else { WithTop::Value(v) }
+        }
+    }
+
+    prop_compose! {
+        fn arb_with_bottom()(is_bot in any::<bool>(), v in any::<u64>()) -> WithBottom<u64> {
+            if is_bot { WithBottom::Bottom } else { WithBottom::Value(v) }
+        }
+    }
+
+    prop_compose! {
+        fn arb_map()(entries in prop::collection::vec((0u64..8, any::<u64>()), 0..6))
+            -> MapLattice<u64, u64> {
+            let mut m = MapLattice::new();
+            for (k, v) in entries { m.insert(k, v); }
+            m
+        }
+    }
+
+    prop_compose! {
+        fn arb_set()(elems in prop::collection::vec(0u64..12, 0..6)) -> SetLattice<u64> {
+            let mut s = SetLattice::new();
+            for e in elems { s.insert(e); }
+            s
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(10_000))]
+
+        #[test]
+        fn consistency_u64(a in any::<u64>(), b in any::<u64>()) {
+            check(&a, &b)?;
+        }
+
+        #[test]
+        fn consistency_product(a in arb_product(), b in arb_product()) {
+            check(&a, &b)?;
+        }
+
+        #[test]
+        fn consistency_lexicographic(a in arb_lexicographic(), b in arb_lexicographic()) {
+            check(&a, &b)?;
+        }
+
+        #[test]
+        fn consistency_max(a in any::<u64>(), b in any::<u64>()) {
+            check(&Max(a), &Max(b))?;
+        }
+
+        #[test]
+        fn consistency_min(a in any::<u64>(), b in any::<u64>()) {
+            check(&Min(a), &Min(b))?;
+        }
+
+        #[test]
+        fn consistency_bounded(a in arb_bounded(), b in arb_bounded()) {
+            check(&a, &b)?;
+        }
+
+        #[test]
+        fn consistency_with_top(a in arb_with_top(), b in arb_with_top()) {
+            check(&a, &b)?;
+        }
+
+        #[test]
+        fn consistency_with_bottom(a in arb_with_bottom(), b in arb_with_bottom()) {
+            check(&a, &b)?;
+        }
+
+        #[test]
+        fn consistency_map_lattice(a in arb_map(), b in arb_map()) {
+            check(&a, &b)?;
+        }
+
+        #[test]
+        fn consistency_set_lattice(a in arb_set(), b in arb_set()) {
+            check(&a, &b)?;
+        }
+
+        // Composition preserves the law: a nested lattice still satisfies it.
+        #[test]
+        fn consistency_nested_with_top_with_bottom(
+            a in arb_with_bottom(), b in arb_with_bottom()
+        ) {
+            let wa = WithTop::Value(a);
+            let wb = WithTop::Value(b);
+            check(&wa, &wb)?;
+        }
+
+        #[test]
+        fn consistency_map_of_product(
+            ea in prop::collection::vec((0u64..6, any::<u64>(), any::<u64>()), 0..5),
+            eb in prop::collection::vec((0u64..6, any::<u64>(), any::<u64>()), 0..5),
+        ) {
+            let mut a: MapLattice<u64, ProductTimestamp<u64, u64>> = MapLattice::new();
+            for (k, x, y) in ea { a.insert(k, ProductTimestamp::new(x, y)); }
+            let mut b: MapLattice<u64, ProductTimestamp<u64, u64>> = MapLattice::new();
+            for (k, x, y) in eb { b.insert(k, ProductTimestamp::new(x, y)); }
+            check(&a, &b)?;
+        }
+    }
+}
+
+// ── Serde round-trip ──────────────────────────────────────────────────────────
+//
+// Locks two guarantees against regression:
+// 1. The inline-storage optimization keeps `Antichain`'s wire format identical to
+//    the original derive (`{ "elements": [...] }`).
+// 2. The `MapLattice`/`SetLattice` serde derives compile and round-trip (the
+//    `serde/alloc` feature wiring and the `Ord` deserialize bounds).
+#[cfg(all(test, feature = "serde"))]
+mod serde_tests {
+    use super::*;
+
+    #[test]
+    fn antichain_wire_format_is_stable() {
+        // Width 1 is stored inline, but must still serialize as { "elements": [..] }.
+        let a = Antichain::from_elem(7u64);
+        let json = serde_json::to_string(&a).unwrap();
+        assert_eq!(json, r#"{"elements":[7]}"#);
+
+        // Empty antichain.
+        let empty = Antichain::<u64>::empty();
+        assert_eq!(serde_json::to_string(&empty).unwrap(), r#"{"elements":[]}"#);
+    }
+
+    #[test]
+    fn antichain_round_trips_at_every_width() {
+        for elems in [vec![], vec![5u64], vec![1u64, 9, 4]] {
+            let mut original = Antichain::<u64>::empty();
+            for e in elems {
+                original.insert(e);
+            }
+            let json = serde_json::to_string(&original).unwrap();
+            let restored: Antichain<u64> = serde_json::from_str(&json).unwrap();
+            assert_eq!(original, restored);
+        }
+    }
+
+    #[test]
+    fn frontier_round_trips() {
+        let f = Frontier::from_elements([3u64, 7, 5]);
+        let json = serde_json::to_string(&f).unwrap();
+        let restored: Frontier<u64> = serde_json::from_str(&json).unwrap();
+        assert_eq!(f, restored);
+    }
+
+    #[test]
+    fn map_lattice_round_trips() {
+        let mut m: MapLattice<u32, u64> = MapLattice::new();
+        m.insert(0, 10);
+        m.insert(1, 20);
+        let json = serde_json::to_string(&m).unwrap();
+        let restored: MapLattice<u32, u64> = serde_json::from_str(&json).unwrap();
+        assert_eq!(m, restored);
+    }
+
+    #[test]
+    fn set_lattice_round_trips() {
+        let mut s: SetLattice<u64> = SetLattice::new();
+        s.insert(1);
+        s.insert(2);
+        s.insert(3);
+        let json = serde_json::to_string(&s).unwrap();
+        let restored: SetLattice<u64> = serde_json::from_str(&json).unwrap();
+        assert_eq!(s, restored);
     }
 }
