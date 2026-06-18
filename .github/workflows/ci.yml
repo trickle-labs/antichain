@@ -97,7 +97,15 @@ jobs:
       - name: Install stable toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: cargo publish
-        run: cargo publish --no-verify --allow-dirty
+      - name: Publish antichain
+        run: cargo publish -p antichain --no-verify --allow-dirty
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+      - name: Wait for antichain to be available on crates.io
+        run: sleep 30
+
+      - name: Publish antichain-intervals
+        run: cargo publish -p antichain-intervals --no-verify --allow-dirty
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
