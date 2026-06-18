@@ -8,7 +8,7 @@
 
 ```toml
 [dependencies]
-antichain = "0.2"
+antichain = "0.3"
 ```
 
 ---
@@ -131,11 +131,11 @@ crate does one thing: **progress tracking. No ownership, no membership, no conse
 
 ```toml
 [dependencies]
-antichain = "0.2"
+antichain = "0.3"
 # with serde support:
-# antichain = { version = "0.2", features = ["serde"] }
+# antichain = { version = "0.3", features = ["serde"] }
 # in a no_std environment (needs a global allocator):
-# antichain = { version = "0.2", default-features = false }
+# antichain = { version = "0.3", default-features = false }
 ```
 
 - **`no_std` friendly** — disable the default `std` feature; only `alloc` is required.
