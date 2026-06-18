@@ -1,0 +1,23 @@
+[package]
+name = "antichain"
+version = "0.1.0"
+edition = "2024"
+description = "A coordinator-free primitive for tracking distributed progress using lattice algebra."
+license = "MIT"
+repository = "https://github.com/geir-gronmo/antichain"
+keywords = ["distributed", "progress", "frontier", "lattice", "antichain"]
+categories = ["data-structures", "algorithms"]
+
+[dependencies]
+serde = { version = "1", optional = true, default-features = false, features = ["derive"] }
+
+[dev-dependencies]
+proptest = "1"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[features]
+serde = ["dep:serde"]
+
+[[bench]]
+name = "frontier"
+harness = false
