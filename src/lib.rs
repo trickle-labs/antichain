@@ -18,6 +18,15 @@
 //! * [`Lexicographic<A, B>`] — lexicographic order: outer dimension dominates; inner breaks ties.
 //!   Used for epoch × offset patterns.
 //!
+//! Three order-modifier wrappers complete the Phase 6 composition toolkit:
+//!
+//! * [`Max<T>`] — inverts `T`'s partial order so that [`Frontier::meet`] computes `max` instead
+//!   of `min`. Tracks "at least X" lower bounds.
+//! * [`Min<T>`] — preserves `T`'s natural order (transparent newtype). Used alongside [`Max`] in
+//!   composite types for semantic clarity.
+//! * [`Bounded<T>`] — clamps values to a `[min, max]` interval, giving a provable upper bound on
+//!   antichain width for finite ranges.
+//!
 //! # Quick start
 //!
 //! ```
@@ -1254,6 +1263,541 @@ mod prop_tests_phase5 {
             );
             prop_assert_eq!(node_a, node_b.clone());
             prop_assert_eq!(node_b, node_c);
+        }
+    }
+}
+
+// ── Phase 6: Extended composition patterns ────────────────────────────────────
+
+/// Wraps `T` and **inverts** its partial order.
+///
+/// `Max(a) ≤ Max(b)` iff `b ≤ a` in `T`.
+///
+/// **Use case:** tracking "at least X" lower bounds in a [`Frontier`]. Because
+/// the order is inverted, [`Frontier::meet`] (the conservative merge) computes
+/// `max` of the underlying values, preserving the *highest* guaranteed lower
+/// bound seen across all workers.
+///
+/// # Example
+///
+/// ```
+/// use antichain::{Frontier, Max};
+///
+/// // Worker A guarantees "offset ≥ 10"; worker B guarantees "offset ≥ 5".
+/// let wa = Frontier::from_elem(Max(10u64));
+/// let wb = Frontier::from_elem(Max(5u64));
+///
+/// // Conservative merge: the merged frontier still guarantees ≥ 10
+/// // (inverted order makes meet = max of underlying values).
+/// let merged = wa.meet(&wb);
+/// assert_eq!(merged.elements(), &[Max(10u64)]);
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct Max<T>(pub T);
+
+impl<T: PartialOrd> PartialOrd for Max<T> {
+    /// Inverted ordering: `Max(a) ≤ Max(b)` iff `b ≤ a`.
+    #[inline]
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        other.0.partial_cmp(&self.0)
+    }
+}
+
+impl<T: Lattice + Clone> Lattice for Max<T> {
+    /// Greatest lower bound in the inverted order = join of the underlying values.
+    ///
+    /// `meet(Max(a), Max(b)) = Max(max(a, b))`
+    #[inline]
+    fn meet(&self, other: &Self) -> Self {
+        Max(self.0.join(&other.0))
+    }
+    /// Least upper bound in the inverted order = meet of the underlying values.
+    ///
+    /// `join(Max(a), Max(b)) = Max(min(a, b))`
+    #[inline]
+    fn join(&self, other: &Self) -> Self {
+        Max(self.0.meet(&other.0))
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Wraps `T` preserving its natural partial order.
+///
+/// `Min(a) ≤ Min(b)` iff `a ≤ b` in `T`.
+///
+/// **Use case:** tracking "at most Y" upper bounds in a [`Frontier`] alongside
+/// [`Max`] lower bounds. In a composite type like `(Max<T>, Min<T>)`, the first
+/// component tracks the minimum guaranteed progress and the second tracks the
+/// maximum observed value, providing both a lower and upper bound simultaneously.
+///
+/// The [`Lattice`] impl delegates directly to `T`, so `meet` computes `min` and
+/// `join` computes `max` — identical to an unwrapped `T`. The newtype makes the
+/// intent explicit and enables clean composition with [`Max<T>`].
+///
+/// # Example
+///
+/// ```
+/// use antichain::{Frontier, Max, Min, Lattice};
+///
+/// // Track a sliding window [lower_bound, upper_bound].
+/// let f1 = Frontier::from_elem((Max(5u64), Min(20u64)));
+/// let f2 = Frontier::from_elem((Max(8u64), Min(15u64)));
+///
+/// // meet: highest lower bound (max(5,8)=8) and lowest upper bound (min(20,15)=15).
+/// let merged = f1.meet(&f2);
+/// assert_eq!(merged.elements()[0].0, Max(8u64));
+/// assert_eq!(merged.elements()[0].1, Min(15u64));
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct Min<T>(pub T);
+
+impl<T: PartialOrd> PartialOrd for Min<T> {
+    #[inline]
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        self.0.partial_cmp(&other.0)
+    }
+}
+
+impl<T: Lattice + Clone> Lattice for Min<T> {
+    #[inline]
+    fn meet(&self, other: &Self) -> Self {
+        Min(self.0.meet(&other.0))
+    }
+    #[inline]
+    fn join(&self, other: &Self) -> Self {
+        Min(self.0.join(&other.0))
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A timestamp wrapper that restricts values to the interval `[min, max]`.
+///
+/// Values are clamped to `[min, max]` at construction time. All [`Lattice`]
+/// operations preserve this invariant. Because the range is finite, the number
+/// of distinct incomparable values — and therefore the maximum width of any
+/// `Antichain<Bounded<T>>` — is bounded by the cardinality of `[min, max]`.
+///
+/// Two `Bounded<T>` values compare by their [`value`][Bounded::value] using
+/// the natural order of `T`. Mixing `Bounded<T>` values with different
+/// `[min, max]` ranges in the same antichain is semantically undefined;
+/// lattice operations use the bounds of `self`.
+///
+/// # Example
+///
+/// ```
+/// use antichain::{Frontier, Bounded};
+///
+/// // Offsets restricted to [0, 1000].
+/// let f1 = Frontier::from_elem(Bounded::new(300u64, 0, 1000));
+/// let f2 = Frontier::from_elem(Bounded::new(700u64, 0, 1000));
+///
+/// // Conservative merge picks the lower value, clamped to the range.
+/// let merged = f1.meet(&f2);
+/// assert_eq!(*merged.elements()[0].value(), 300u64);
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct Bounded<T> {
+    /// The current value, always in `[min, max]`.
+    pub value: T,
+    /// The inclusive lower bound of the range.
+    pub min: T,
+    /// The inclusive upper bound of the range.
+    pub max: T,
+}
+
+impl<T: Ord + Clone> Bounded<T> {
+    /// Creates a `Bounded<T>`, clamping `value` to `[min, max]`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `min > max`.
+    pub fn new(value: T, min: T, max: T) -> Self {
+        assert!(min <= max, "Bounded: min must be <= max");
+        let value = if value < min {
+            min.clone()
+        } else if value > max {
+            max.clone()
+        } else {
+            value
+        };
+        Self { value, min, max }
+    }
+
+    /// Returns a reference to the current value.
+    pub fn value(&self) -> &T {
+        &self.value
+    }
+}
+
+impl<T: PartialOrd> PartialOrd for Bounded<T> {
+    #[inline]
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        self.value.partial_cmp(&other.value)
+    }
+}
+
+impl<T: Lattice + Ord + Clone> Lattice for Bounded<T> {
+    fn meet(&self, other: &Self) -> Self {
+        let v = self.value.meet(&other.value);
+        let v = if v < self.min {
+            self.min.clone()
+        } else if v > self.max {
+            self.max.clone()
+        } else {
+            v
+        };
+        Bounded { value: v, min: self.min.clone(), max: self.max.clone() }
+    }
+
+    fn join(&self, other: &Self) -> Self {
+        let v = self.value.join(&other.value);
+        let v = if v < self.min {
+            self.min.clone()
+        } else if v > self.max {
+            self.max.clone()
+        } else {
+            v
+        };
+        Bounded { value: v, min: self.min.clone(), max: self.max.clone() }
+    }
+}
+
+// ── Phase 6 tests ─────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests_phase6 {
+    use super::*;
+
+    // ── Max<T> ───────────────────────────────────────────────────────────────
+
+    #[test]
+    fn max_order_is_inverted() {
+        // In Max<u64>, larger underlying value is "smaller".
+        assert!(Max(10u64) < Max(5u64));
+        assert!(Max(5u64) > Max(10u64));
+        assert_eq!(Max(7u64), Max(7u64));
+    }
+
+    #[test]
+    fn max_meet_gives_underlying_max() {
+        assert_eq!(Max(3u64).meet(&Max(7u64)), Max(7u64));
+        assert_eq!(Max(7u64).meet(&Max(3u64)), Max(7u64));
+    }
+
+    #[test]
+    fn max_join_gives_underlying_min() {
+        assert_eq!(Max(3u64).join(&Max(7u64)), Max(3u64));
+        assert_eq!(Max(7u64).join(&Max(3u64)), Max(3u64));
+    }
+
+    #[test]
+    fn frontier_max_meet_picks_highest_lower_bound() {
+        let wa = Frontier::from_elem(Max(10u64));
+        let wb = Frontier::from_elem(Max(5u64));
+        let merged = wa.meet(&wb);
+        assert_eq!(merged.elements(), &[Max(10u64)]);
+    }
+
+    #[test]
+    fn frontier_max_meet_is_commutative() {
+        let a = Frontier::from_elem(Max(10u64));
+        let b = Frontier::from_elem(Max(5u64));
+        assert_eq!(a.meet(&b), b.meet(&a));
+    }
+
+    #[test]
+    fn frontier_max_meet_is_idempotent() {
+        let f = Frontier::from_elem(Max(7u64));
+        assert_eq!(f.meet(&f), f);
+    }
+
+    // ── Min<T> ───────────────────────────────────────────────────────────────
+
+    #[test]
+    fn min_order_is_natural() {
+        assert!(Min(3u64) < Min(7u64));
+        assert_eq!(Min(5u64), Min(5u64));
+    }
+
+    #[test]
+    fn min_meet_gives_underlying_min() {
+        assert_eq!(Min(3u64).meet(&Min(7u64)), Min(3u64));
+    }
+
+    #[test]
+    fn min_join_gives_underlying_max() {
+        assert_eq!(Min(3u64).join(&Min(7u64)), Min(7u64));
+    }
+
+    // ── (Max<T>, Min<T>) composite ───────────────────────────────────────────
+
+    #[test]
+    fn composite_max_min_frontier_meet() {
+        let f1 = Frontier::from_elem((Max(5u64), Min(20u64)));
+        let f2 = Frontier::from_elem((Max(8u64), Min(15u64)));
+        let merged = f1.meet(&f2);
+        // Tuple meet is component-wise: Max meets to max(5,8)=8, Min meets to min(20,15)=15.
+        assert_eq!(merged.elements()[0].0, Max(8u64));
+        assert_eq!(merged.elements()[0].1, Min(15u64));
+    }
+
+    // ── Bounded<T> ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn bounded_new_clamps_value() {
+        let b = Bounded::new(1500u64, 0, 1000);
+        assert_eq!(*b.value(), 1000u64);
+
+        let b2 = Bounded::new(0u64, 100, 1000);
+        assert_eq!(*b2.value(), 100u64);
+    }
+
+    #[test]
+    fn bounded_new_keeps_in_range_value() {
+        let b = Bounded::new(500u64, 0, 1000);
+        assert_eq!(*b.value(), 500u64);
+    }
+
+    #[test]
+    #[should_panic]
+    fn bounded_new_panics_if_min_gt_max() {
+        Bounded::new(5u64, 10, 0);
+    }
+
+    #[test]
+    fn bounded_meet_gives_lower_value_clamped() {
+        let a = Bounded::new(300u64, 0, 1000);
+        let b = Bounded::new(700u64, 0, 1000);
+        assert_eq!(*a.meet(&b).value(), 300u64);
+        assert_eq!(*b.meet(&a).value(), 300u64);
+    }
+
+    #[test]
+    fn bounded_join_gives_higher_value_clamped() {
+        let a = Bounded::new(300u64, 0, 1000);
+        let b = Bounded::new(700u64, 0, 1000);
+        assert_eq!(*a.join(&b).value(), 700u64);
+    }
+
+    #[test]
+    fn bounded_order_by_value() {
+        let a = Bounded::new(200u64, 0, 1000);
+        let b = Bounded::new(800u64, 0, 1000);
+        assert!(a < b);
+    }
+
+    #[test]
+    fn frontier_bounded_meet_is_conservative() {
+        let f1 = Frontier::from_elem(Bounded::new(300u64, 0, 1000));
+        let f2 = Frontier::from_elem(Bounded::new(700u64, 0, 1000));
+        let merged = f1.meet(&f2);
+        assert_eq!(*merged.elements()[0].value(), 300u64);
+    }
+
+    #[test]
+    fn frontier_bounded_antichain_width_bounded() {
+        // For Bounded<u64> values in [0, 5] they are totally ordered → antichain width ≤ 1.
+        let f = Frontier::from_elements([
+            Bounded::new(2u64, 0, 5),
+            Bounded::new(4u64, 0, 5),
+            Bounded::new(1u64, 0, 5),
+        ]);
+        // All are totally ordered; only the minimum (1) survives.
+        assert_eq!(f.elements().len(), 1);
+        assert_eq!(*f.elements()[0].value(), 1u64);
+    }
+
+    // ── Nested composition: ProductTimestamp<Bounded<u64>, u64> ──────────────
+
+    #[test]
+    fn nested_product_bounded_outer() {
+        // Frontier<ProductTimestamp<Bounded<u64>, u64>>: bounded outer, unbounded inner.
+        let f1 = Frontier::from_elem(ProductTimestamp::new(
+            Bounded::new(3u64, 0, 10),
+            100u64,
+        ));
+        let f2 = Frontier::from_elem(ProductTimestamp::new(
+            Bounded::new(7u64, 0, 10),
+            50u64,
+        ));
+        // (3, 100) and (7, 50) are incomparable in product order → both survive meet.
+        let merged = f1.meet(&f2);
+        assert_eq!(merged.elements().len(), 2);
+    }
+}
+
+// ── Phase 6 property tests ────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod prop_tests_phase6 {
+    use super::*;
+    use proptest::prelude::*;
+
+    prop_compose! {
+        fn arb_max_u64()(v in any::<u64>()) -> Max<u64> { Max(v) }
+    }
+
+    prop_compose! {
+        fn arb_min_u64()(v in any::<u64>()) -> Min<u64> { Min(v) }
+    }
+
+    prop_compose! {
+        fn arb_bounded()(
+            a in 0u64..=500u64,
+            b in 0u64..=500u64,
+            v in 0u64..=1000u64,
+        ) -> Bounded<u64> {
+            let lo = a.min(b);
+            let hi = a.max(b) + 1; // ensure lo < hi
+            Bounded::new(v, lo, lo + hi)
+        }
+    }
+
+    prop_compose! {
+        fn arb_frontier_max()(
+            elems in prop::collection::vec(any::<u64>(), 0..10)
+        ) -> Frontier<Max<u64>> {
+            Frontier::from_elements(elems.into_iter().map(Max))
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(10_000))]
+
+        // ── Max<u64>: order laws ──────────────────────────────────────────────
+
+        #[test]
+        fn prop_max_order_inverted(a in any::<u64>(), b in any::<u64>()) {
+            // Max(a) <= Max(b) iff b <= a.
+            let ma = Max(a);
+            let mb = Max(b);
+            if a <= b {
+                prop_assert!(mb <= ma);
+            }
+            if b <= a {
+                prop_assert!(ma <= mb);
+            }
+        }
+
+        #[test]
+        fn prop_max_meet_is_underlying_join(a in any::<u64>(), b in any::<u64>()) {
+            prop_assert_eq!(Max(a).meet(&Max(b)), Max(a.join(&b)));
+        }
+
+        #[test]
+        fn prop_max_join_is_underlying_meet(a in any::<u64>(), b in any::<u64>()) {
+            prop_assert_eq!(Max(a).join(&Max(b)), Max(a.meet(&b)));
+        }
+
+        #[test]
+        fn prop_max_meet_commutative(a in any::<u64>(), b in any::<u64>()) {
+            prop_assert_eq!(Max(a).meet(&Max(b)), Max(b).meet(&Max(a)));
+        }
+
+        #[test]
+        fn prop_max_meet_idempotent(a in any::<u64>()) {
+            prop_assert_eq!(Max(a).meet(&Max(a)), Max(a));
+        }
+
+        // ── Min<u64>: Lattice laws ────────────────────────────────────────────
+
+        #[test]
+        fn prop_min_meet_is_underlying_meet(a in any::<u64>(), b in any::<u64>()) {
+            prop_assert_eq!(Min(a).meet(&Min(b)), Min(a.meet(&b)));
+        }
+
+        #[test]
+        fn prop_min_join_is_underlying_join(a in any::<u64>(), b in any::<u64>()) {
+            prop_assert_eq!(Min(a).join(&Min(b)), Min(a.join(&b)));
+        }
+
+        // ── Frontier<Max<u64>>: meet laws ─────────────────────────────────────
+
+        #[test]
+        fn prop_frontier_max_meet_commutative(
+            a in arb_frontier_max(), b in arb_frontier_max()
+        ) {
+            prop_assert_eq!(a.meet(&b), b.meet(&a));
+        }
+
+        #[test]
+        fn prop_frontier_max_meet_associative(
+            a in arb_frontier_max(), b in arb_frontier_max(), c in arb_frontier_max()
+        ) {
+            prop_assert_eq!(a.meet(&b.meet(&c)), a.meet(&b).meet(&c));
+        }
+
+        #[test]
+        fn prop_frontier_max_meet_idempotent(a in arb_frontier_max()) {
+            prop_assert_eq!(a.meet(&a), a);
+        }
+
+        // ── Bounded<u64>: value always in range ───────────────────────────────
+
+        #[test]
+        fn prop_bounded_value_in_range(
+            lo in 0u64..500u64,
+            hi in 500u64..1000u64,
+            v in any::<u64>()
+        ) {
+            let b = Bounded::new(v, lo, hi);
+            prop_assert!(*b.value() >= lo);
+            prop_assert!(*b.value() <= hi);
+        }
+
+        #[test]
+        fn prop_bounded_meet_value_in_range(
+            lo in 0u64..200u64,
+            hi in 800u64..1000u64,
+            v1 in 0u64..1000u64,
+            v2 in 0u64..1000u64,
+        ) {
+            let a = Bounded::new(v1, lo, hi);
+            let b = Bounded::new(v2, lo, hi);
+            let m = a.meet(&b);
+            prop_assert!(*m.value() >= lo);
+            prop_assert!(*m.value() <= hi);
+        }
+
+        #[test]
+        fn prop_bounded_join_value_in_range(
+            lo in 0u64..200u64,
+            hi in 800u64..1000u64,
+            v1 in 0u64..1000u64,
+            v2 in 0u64..1000u64,
+        ) {
+            let a = Bounded::new(v1, lo, hi);
+            let b = Bounded::new(v2, lo, hi);
+            let j = a.join(&b);
+            prop_assert!(*j.value() >= lo);
+            prop_assert!(*j.value() <= hi);
+        }
+
+        #[test]
+        fn prop_bounded_meet_commutative(
+            lo in 0u64..200u64,
+            hi in 800u64..1000u64,
+            v1 in 0u64..1000u64,
+            v2 in 0u64..1000u64,
+        ) {
+            let a = Bounded::new(v1, lo, hi);
+            let b = Bounded::new(v2, lo, hi);
+            prop_assert_eq!(a.meet(&b), b.meet(&a));
+        }
+
+        #[test]
+        fn prop_bounded_meet_idempotent(
+            lo in 0u64..200u64,
+            hi in 800u64..1000u64,
+            v in 0u64..1000u64,
+        ) {
+            let a = Bounded::new(v, lo, hi);
+            prop_assert_eq!(a.meet(&a), a);
         }
     }
 }

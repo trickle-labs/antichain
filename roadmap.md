@@ -17,7 +17,7 @@
 | 3 | Composition | Product, lexicographic, nested orders | Composed frontiers work correctly |
 | 4 | Hardening | Benchmarks, fuzzing, docs, `#![no_std]` compat | Crate is publishable |
 | 5 | Formal specification | TLA⁺ or Lean proof of convergence | Spec written, convergence proven |
-| 6 | Extended composition patterns | Additional useful partial orders | `Max<T>`, `Min<T>`, `Bounded<T>` working |
+| 6 | Extended composition patterns | Additional useful partial orders | ✅ `Max<T>`, `Min<T>`, `Bounded<T>` working |
 
 ---
 
@@ -272,7 +272,7 @@ From `idea.md` §8, mapped to phases:
 
 **Goal:** add useful partial orders for real-world use-cases.
 
-### 6.1 `Max<T>` and `Min<T>` wrappers
+### 6.1 `Max<T>` and `Min<T>` wrappers ✅
 
 Wrappers that flip the partial order of any type without requiring a custom `Lattice` impl:
 
@@ -286,7 +286,7 @@ pub struct Min<T>(pub T);
 
 Used for tracking "at least X" vs. "at most Y" bounds in the same frontier.
 
-### 6.2 `Bounded<T>`
+### 6.2 `Bounded<T>` ✅
 
 A newtype for finite ranges where the partial order is restricted to a known interval `[min, max]`.
 Enables bounded-width antichain guarantees: if `T` is bounded, the antichain width is provably ≤ the cardinality of the bound.
@@ -295,12 +295,14 @@ Enables bounded-width antichain guarantees: if `T` is bounded, the antichain wid
 pub struct Bounded<T> { value: T, min: T, max: T }
 ```
 
-### 6.3 Nested composition examples
+### 6.3 Nested composition examples ✅
 
 Document patterns like:
 - `Frontier<ProductTimestamp<Bounded<u64>, u64>>` — bounded outer clock, unbounded inner
 - `Frontier<(Max<u64>, Min<u64>)>` — independent lower and upper bounds
 - Integration with the formal spec: prove that nesting preserves the convergence guarantee
+
+All patterns are covered by unit tests in `tests_phase6` and property tests in `prop_tests_phase6`.
 
 ---
 
