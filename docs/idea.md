@@ -86,7 +86,7 @@ Keeping this boundary sharp is the single most important discipline for the idea
 
 If we are distilling toward "perfect," these are the properties the essence should hold to:
 
-1. **Generic over time `T`.** The primitive should know nothing about RockStream, SlateDB, sources, or shards. It operates on any `T` that forms a partial order (a lattice). Domain types plug in from outside.
+1. **Generic over time `T`.** The primitive should know nothing about specific systems, sources, or shards. It operates on any `T` that forms a partial order (a lattice). Domain types plug in from outside.
 2. **Minimal dependencies.** Ideally just the standard library plus serialization. A coordination *primitive* should be as boring and portable as possible.
 3. **Laws proven, not assumed.** Commutativity, associativity, idempotence, absorption, and the antichain-maintenance invariant should be property-tested (and ideally formally specified). The laws *are* the product; they must be guaranteed, not hoped for.
 4. **Total clarity of scope.** Progress only. No ownership, no membership, no consensus. The README should say so on line one.
