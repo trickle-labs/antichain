@@ -1,6 +1,6 @@
 [package]
 name = "antichain"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "A coordinator-free primitive for tracking distributed progress using lattice algebra."
 license = "Apache-2.0"
