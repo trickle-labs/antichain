@@ -63,7 +63,7 @@ After stripping, the only crate-level dependencies should be:
 - [ ] Write `README.md` opening line: *"A coordinator-free primitive for tracking distributed progress using lattice algebra."* State scope on line one (progress only; no ownership, no consensus).
 - [ ] Commit `idea.md` into the repo as `docs/idea.md` — the spec lives with the code.
 
-> **Naming:** The foundational crate claims the root name `antichain`, following the convention of `serde`, `tokio`, `arrow`. Suffixes like `-grpc` or `-rockstream` are reserved for Phase 5 adapter crates.
+> **Naming:** The foundational crate claims the root name `antichain`, following the convention of `serde`, `tokio`, `arrow`.
 
 ---
 
@@ -238,22 +238,6 @@ benchmarks must explicitly stress this before the crate is published:
 - [ ] Full rustdoc with examples and law explanations inline.
 - [ ] Convergence guarantee stated as a doc-test: *"Two nodes that have each seen any subset of the same update set, in any order, will hold identical `Frontier` values after merging."*
 - [ ] Publish `antichain` to `crates.io` at `0.1.0`.
-
----
-
-## Phase 5 — Integration adapters (separate crates)
-
-**Goal:** let real systems use the primitive without contaminating the core.
-
-The core crate **never** takes a dependency on any of the below. Adapters depend on the core; not the reverse.
-
-| Crate | Purpose |
-|-------|---------|
-| `antichain-rockstream` | `Frontier` as the progress type in RockStream's dataflow graph |
-| `antichain-slatedb` | Watermark tracking for SlateDB compaction / read progress |
-| `antichain-grpc` | Protobuf codec for exchanging `Frontier` over gRPC |
-
-Each adapter crate gets its own CI, its own versioning, and its own README that explains the seam between *progress* (Antichain) and *ownership* (whatever the host system provides).
 
 ---
 
