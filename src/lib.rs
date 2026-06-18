@@ -1,4 +1,93 @@
 //! A coordinator-free primitive for tracking distributed progress using lattice algebra.
+//!
+//! # Overview
+//!
+//! This crate provides three core primitives:
+//!
+//! * [`Lattice`] — a trait for types with a greatest lower bound (`meet`) and least upper bound
+//!   (`join`), consistent with `PartialOrd`.
+//! * [`Antichain<T>`] — a set of mutually incomparable elements maintaining the antichain
+//!   invariant: no element is `<=` any other.
+//! * [`Frontier<T>`] — a progress claim: all timestamps strictly less than some antichain element
+//!   are considered complete.
+//!
+//! Two composition types are also provided:
+//!
+//! * [`ProductTimestamp<T1, T2>`] — product order: `(a1, b1) ≤ (a2, b2)` iff `a1 ≤ a2` **and**
+//!   `b1 ≤ b2`. Used for independent multi-dimensional clocks.
+//! * [`Lexicographic<A, B>`] — lexicographic order: outer dimension dominates; inner breaks ties.
+//!   Used for epoch × offset patterns.
+//!
+//! # Quick start
+//!
+//! ```
+//! use antichain::Frontier;
+//!
+//! // Two workers report their progress independently.
+//! let worker_a = Frontier::from_elem(5u64);
+//! let worker_b = Frontier::from_elem(3u64);
+//!
+//! // Merge without coordination — meet is commutative, associative, and idempotent.
+//! let merged = worker_a.meet(&worker_b);
+//! assert_eq!(merged, worker_b.meet(&worker_a));  // commutative
+//! assert!(merged.less_equal(&3));                // timestamp 3 is still in-flight
+//! assert!(!merged.less_equal(&7));               // timestamp 7 is past the frontier
+//! ```
+//!
+//! # Convergence guarantee
+//!
+//! Two nodes that have each seen any subset of the same update set, in any order, will hold
+//! identical [`Frontier`] values after merging.
+//!
+//! ```
+//! use antichain::Frontier;
+//!
+//! let updates = [
+//!     Frontier::from_elem(3u64),
+//!     Frontier::from_elem(7u64),
+//!     Frontier::from_elem(5u64),
+//! ];
+//!
+//! // Node A applies updates in order [0, 1, 2].
+//! let node_a = updates[0].meet(&updates[1]).meet(&updates[2]);
+//!
+//! // Node B applies updates in a different order [2, 0, 1].
+//! let node_b = updates[2].meet(&updates[0]).meet(&updates[1]);
+//!
+//! // Node C applies updates in yet another order [1, 2, 0].
+//! let node_c = updates[1].meet(&updates[2]).meet(&updates[0]);
+//!
+//! // All three converge to the same value regardless of order.
+//! assert_eq!(node_a, node_b);
+//! assert_eq!(node_b, node_c);
+//! ```
+//!
+//! # `no_std` support
+//!
+//! Disable the default `std` feature to use this crate in `no_std` environments. A global
+//! allocator must be present (`extern crate alloc` is used internally):
+//!
+//! ```toml
+//! [dependencies]
+//! antichain = { version = "0.1", default-features = false }
+//! ```
+//!
+//! # Feature flags
+//!
+//! | Feature | Default | Description |
+//! |---------|---------|-------------|
+//! | `std`   | yes     | Link against `std`; disable for `no_std` + `alloc` environments. |
+//! | `serde` | no      | Derive `Serialize` / `Deserialize` for all public types. |
+
+#![cfg_attr(not(feature = "std"), no_std)]
+
+#[cfg(not(feature = "std"))]
+extern crate alloc;
+
+#[cfg(not(feature = "std"))]
+use alloc::vec;
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
 
 // ── Lattice ───────────────────────────────────────────────────────────────────
 
@@ -73,8 +162,8 @@ impl<T1, T2> ProductTimestamp<T1, T2> {
 }
 
 impl<T1: PartialOrd, T2: PartialOrd> PartialOrd for ProductTimestamp<T1, T2> {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        use std::cmp::Ordering::{Equal, Greater, Less};
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        use core::cmp::Ordering::{Equal, Greater, Less};
         match (
             self.outer.partial_cmp(&other.outer),
             self.inner.partial_cmp(&other.inner),
@@ -132,9 +221,9 @@ impl<A, B> Lexicographic<A, B> {
 }
 
 impl<A: Ord, B: PartialOrd> PartialOrd for Lexicographic<A, B> {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
         match self.outer.cmp(&other.outer) {
-            std::cmp::Ordering::Equal => self.inner.partial_cmp(&other.inner),
+            core::cmp::Ordering::Equal => self.inner.partial_cmp(&other.inner),
             ord => Some(ord),
         }
     }
@@ -143,9 +232,9 @@ impl<A: Ord, B: PartialOrd> PartialOrd for Lexicographic<A, B> {
 impl<A: Ord + Clone, B: Lattice + Clone> Lattice for Lexicographic<A, B> {
     fn meet(&self, other: &Self) -> Self {
         match self.outer.cmp(&other.outer) {
-            std::cmp::Ordering::Less => self.clone(),
-            std::cmp::Ordering::Greater => other.clone(),
-            std::cmp::Ordering::Equal => Lexicographic {
+            core::cmp::Ordering::Less => self.clone(),
+            core::cmp::Ordering::Greater => other.clone(),
+            core::cmp::Ordering::Equal => Lexicographic {
                 outer: self.outer.clone(),
                 inner: self.inner.meet(&other.inner),
             },
@@ -153,9 +242,9 @@ impl<A: Ord + Clone, B: Lattice + Clone> Lattice for Lexicographic<A, B> {
     }
     fn join(&self, other: &Self) -> Self {
         match self.outer.cmp(&other.outer) {
-            std::cmp::Ordering::Less => other.clone(),
-            std::cmp::Ordering::Greater => self.clone(),
-            std::cmp::Ordering::Equal => Lexicographic {
+            core::cmp::Ordering::Less => other.clone(),
+            core::cmp::Ordering::Greater => self.clone(),
+            core::cmp::Ordering::Equal => Lexicographic {
                 outer: self.outer.clone(),
                 inner: self.inner.join(&other.inner),
             },
@@ -205,7 +294,8 @@ impl<T: PartialOrd + Clone> Antichain<T> {
         if self.elements.iter().any(|e| *e <= t) {
             return;
         }
-        self.elements.retain(|e| !(t <= *e));
+        self.elements
+            .retain(|e| t.partial_cmp(e).is_none_or(|o| o == core::cmp::Ordering::Greater));
         self.elements.push(t);
     }
 
@@ -277,9 +367,31 @@ impl<T: PartialOrd + Clone> Frontier<T> {
 
     /// Coordinator-free merge: the most conservative frontier dominated by both.
     ///
-    /// Commutative, associative, and idempotent — safe to apply without coordination.
-    /// Two nodes that have each seen any subset of the same update set, in any order,
-    /// will hold identical `Frontier` values after merging.
+    /// This is the lattice **meet** (greatest lower bound): the result is the most advanced
+    /// frontier that is still less than or equal to both inputs.
+    ///
+    /// Properties proven by the Phase 2 property tests:
+    /// - **Commutative**: `meet(a, b) == meet(b, a)`
+    /// - **Associative**: `meet(a, meet(b, c)) == meet(meet(a, b), c)`
+    /// - **Idempotent**: `meet(a, a) == a`
+    ///
+    /// **Convergence guarantee**: two nodes that have each seen any subset of the same update set,
+    /// in any order, will hold identical `Frontier` values after calling `meet` for each update.
+    ///
+    /// ```
+    /// use antichain::Frontier;
+    ///
+    /// let f1 = Frontier::from_elem(7u64);
+    /// let f2 = Frontier::from_elem(3u64);
+    ///
+    /// // meet returns the more conservative (lower) frontier
+    /// let merged = f1.meet(&f2);
+    /// assert!(merged.less_equal(&3));   // 3 still in-flight
+    /// assert!(!merged.less_equal(&7));  // 7 is past the merged frontier
+    ///
+    /// // order of application does not matter
+    /// assert_eq!(f1.meet(&f2), f2.meet(&f1));
+    /// ```
     pub fn meet(&self, other: &Self) -> Self {
         let mut antichain = Antichain::empty();
         for e in self.antichain.elements() {
@@ -499,7 +611,7 @@ mod tests {
     fn product_order_equal() {
         let a = ProductTimestamp::new(3u64, 5u64);
         let b = ProductTimestamp::new(3u64, 5u64);
-        assert_eq!(a.partial_cmp(&b), Some(std::cmp::Ordering::Equal));
+        assert_eq!(a.partial_cmp(&b), Some(core::cmp::Ordering::Equal));
     }
 
     #[test]

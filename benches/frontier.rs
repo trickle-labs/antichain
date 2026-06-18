@@ -65,10 +65,34 @@ fn bench_frontier_meet_u64(c: &mut Criterion) {
     group.finish();
 }
 
+// ── Antichain::less_equal (dominates check) — O(n) scan ──────────────────────
+//
+// Measures the hot-path query: "is this timestamp still in-flight?"
+// Worst case: the queried time is incomparable with all elements, so every
+// element is examined before returning false.
+
+fn bench_antichain_dominates(c: &mut Criterion) {
+    let mut group = c.benchmark_group("antichain_dominates");
+    for width in [1u64, 10, 100, 500, 1000] {
+        // Build a wide antichain of incomparable ProductTimestamp elements.
+        let mut a = antichain::Antichain::<ProductTimestamp<u64, u64>>::empty();
+        for i in 0..width {
+            a.insert(ProductTimestamp::new(i, width - i));
+        }
+        // Query an element that is incomparable with all (falls off the anti-diagonal).
+        let probe = ProductTimestamp::new(width + 1, width + 1);
+        group.bench_with_input(BenchmarkId::from_parameter(width), &width, |b, _| {
+            b.iter(|| a.less_equal(&probe));
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_antichain_insert_product,
     bench_frontier_meet_wide,
-    bench_frontier_meet_u64
+    bench_frontier_meet_u64,
+    bench_antichain_dominates,
 );
 criterion_main!(benches);

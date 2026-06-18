@@ -1,0 +1,25 @@
+[package]
+name = "antichain-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+antichain = { path = ".." }
+
+# Each fuzz target is a separate binary.
+[[bin]]
+name = "fuzz_insert"
+path = "fuzz_targets/fuzz_insert.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_meet"
+path = "fuzz_targets/fuzz_meet.rs"
+test = false
+doc = false
