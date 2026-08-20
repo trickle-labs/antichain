@@ -464,6 +464,8 @@ messages are being dropped and reordered.
 
 ## Learn more
 
+- **[Glossary](GLOSSARY.md)** — the project's shared vocabulary for progress, lattices,
+  frontiers, convergence, and the systems built around them.
 - **[FAQ](docs/faq.md)** — 100+ plain-language questions and answers, starting gentle for the
   curious reader and gradually going deeper for engineers and the mathematically minded.
 - **[Tutorial](docs/tutorial.md)** — *"from one number to a frontier,"* a narrative walkthrough
